@@ -41,8 +41,13 @@ function serveStatic(req, res) {
   const u = new URL(req.url, 'http://localhost');
   let p = path.normalize(u.pathname).replace(/^([/\\])+/, '');
   if (p === '' || p === '.') p = 'tools/model-training.html';   // 根路径直达工作台
+  // 静态文件只允许 tools/ 内（白名单）：
+  // .env（密钥）、data/（含 servers.json SSH 凭据与数据集）、源码与测试一律不可经 HTTP 读取。
+  const rel = path.relative(path.join(__dirname, 'tools'), path.join(__dirname, p));
+  if (p !== 'tools/model-training.html' && (rel.startsWith('..') || path.isAbsolute(rel))) {
+    res.writeHead(403); return res.end('forbidden');
+  }
   const file = path.join(__dirname, p);
-  if (!file.startsWith(__dirname)) { res.writeHead(403); return res.end('forbidden'); }
   fs.readFile(file, function (err, buf) {
     if (err) { res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' }); return res.end('404: ' + p); }
     res.writeHead(200, {

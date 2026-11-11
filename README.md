@@ -86,7 +86,7 @@ routes/dataset-tools*.js  数据集：嗅探/质检漏斗/转换/合成（5+2 �
 routes/experiment-report*.js 实验报告：聚合/统计检验/AI 叙述（事实包+回锚）
 tools/model-training.html 单页前端（Plotly 本地化，无外网依赖）
 tools/vendor/plotly.min.js Plotly.js（MIT，见 PLOTLY-LICENSE.txt）
-tests/                    12 套 209 项回归测试（npm test）
+tests/                    12 套 173 项回归测试（npm test）
 ```
 
 ## License
