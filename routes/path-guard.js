@@ -12,10 +12,8 @@
 const fs = require('node:fs');
 const path = require('node:path');
 
-const DEFAULT_ROOTS = [
-  'D:\\llm-training',                    // 本机训练工作区（数据集通常放这里）
-  path.join(__dirname, '..', 'data'),    // 项目数据目录
-];
+const DEFAULT_ROOTS = [path.join(__dirname, '..', 'data')]
+  .concat(process.env.TRAINING_ROOT ? [process.env.TRAINING_ROOT] : []);  // TRAINING_ROOT 未配置则只含项目 data
 
 function configuredRoots() {
   const raw = (process.env.DATASET_IMPORT_ROOTS || '').trim();

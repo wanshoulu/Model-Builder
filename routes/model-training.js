@@ -234,6 +234,17 @@ function findServer(id) {
  */
 function isLocal(server) { return !!(server && server.local); }
 
+/**
+ * 训练环境路径（可配置，不写死开发机布局）：
+ *   TRAINING_ROOT  训练环境根目录（train_rlcd.py / kev_rlcd_bridge.py / venv 所在地）
+ *   TRAINING_WORKDIR  任务工作目录（data/jobs/logs/run/saves）
+ *   TRAINING_CLI   llamafactory-cli 路径（默认取 TRAINING_ROOT/venv/...，Linux 自动换 bin）
+ */
+const TRAINING_ROOT = process.env.TRAINING_ROOT || process.env.TRAINING_DIR || '.';
+const TRAINING_WORKDIR = process.env.TRAINING_WORKDIR || (TRAINING_ROOT + '/ai-harbor-training');
+const TRAINING_CLI = process.env.TRAINING_CLI ||
+  (process.platform === 'win32' ? TRAINING_ROOT + '/venv/Scripts/llamafactory-cli.exe' : TRAINING_ROOT + '/venv/bin/llamafactory-cli');
+
 /** Windows 路径 ↔ bash 路径（D:/x 或 D:\x → /d/x）。非盘符路径原样返回。 */
 function toBashPath(p) {
   const s = String(p || '');
@@ -981,11 +992,11 @@ function buildRlcdTrainCommand(server, jobId, cfg, ds) {
   const pyBin = server.cliPath
     ? require('path').dirname(server.cliPath).replace(/\\/g, '/') + '/python.exe'
     : 'python3';
-  // RLCD 脚本固定在 D:/llm-training（训练 venv 同目录）；数据/产物用 workdir 相对路径
+  // RLCD 脚本在 TRAINING_ROOT（训练 venv 同目录，环境变量可配）；数据/产物用 workdir 相对路径
   // 基座模型：HuggingFace 名会在离线环境失败，本地路径直接可用（冒烟已验证）
-  const baseModel = cfg.modelName || 'D:/llm-training/models/Qwen3-0.6B';
+  const baseModel = cfg.modelName || (TRAINING_ROOT + '/models/Qwen3-0.6B');
   const args = [
-    'D:/llm-training/train_rlcd.py',
+    TRAINING_ROOT + '/train_rlcd.py',
     '--data-dir', 'rlcd-data/' + jobId,
     '--base', baseModel,
     '--steps', String(cfg.rlcdSteps || 100),
@@ -1114,7 +1125,7 @@ function createEvalIo(server, job, opts) {
         // rlcd 任务的 checkpoint 是 rlcd-lite adapter（不是 kev head.pt），
         // 走 train_rlcd.py eval 子命令；kev 任务走原生 kev.benchmark。
         const cmd = job.trainMode === 'rlcd'
-          ? 'cd ' + shq(bashPath('')) + ' && ' + shq(pyBin) + ' D:/llm-training/train_rlcd.py eval' +
+          ? 'cd ' + shq(bashPath('')) + ' && ' + shq(pyBin) + ' ' + shq(TRAINING_ROOT + '/train_rlcd.py') + ' eval' +
             ' --run ' + shq('saves/' + job.id) +
             ' --eval-data ' + shq(evalFile) +
             ' --out ' + shq(outDir) + ' --device cuda --dtype bf16'
@@ -1276,8 +1287,8 @@ async function handleModelTrainingRequest(req, res) {
           id: newId('srv'),
           local: true,
           name: p.name || '本机（localhost）',
-          remoteWorkdir: p.remoteWorkdir || 'D:/llm-training/ai-harbor-training',
-          cliPath: p.cliPath || 'D:/llm-training/venv/Scripts/llamafactory-cli.exe',
+          remoteWorkdir: p.remoteWorkdir || TRAINING_WORKDIR,
+          cliPath: p.cliPath || TRAINING_CLI,
         }, p, { createdAt: Date.now() });
         list.push(server);
       }
@@ -1651,10 +1662,10 @@ async function handleModelTrainingRequest(req, res) {
       // ═══ RLCD 分支（decision 数据 + trainMethod=rlcd → GRPO + RLCR 奖励，基线 rlcd-lite）═══
       // 与 kev（纯监督 CE）的区别：RL 阶段训练决策准确率 + 概率校准（stated confidence）。
       if (ds.kind === 'decision' && cfg.trainMethod === 'rlcd') {
-        // RLCD 脚本依赖：D:/llm-training/{train_rlcd.py,kev_rlcd_bridge.py,rlcd-lite/,rlcd-data/}
+        // RLCD 脚本依赖：$TRAINING_ROOT/{train_rlcd.py,kev_rlcd_bridge.py,rlcd-lite/,rlcd-data/}
         // 本地模式直接跑；远端模式需先同步脚本（暂不开放，提示用本机）
         if (!isLocal(server)) {
-          return sendJson(res, 400, { ok: false, error: 'RLCD 训练暂只支持本机训练服务器（rlcd-lite 脚本环境在本机 D:/llm-training）。远端部署待阶段 2。' });
+          return sendJson(res, 400, { ok: false, error: 'RLCD 训练暂只支持本机训练服务器（rlcd-lite 脚本环境需在 TRAINING_ROOT 指定的目录）。远端部署待阶段 2。' });
         }
         // 1) 上传原始 decision JSONL（复用已读取的原始文本，保持逐行格式）
         await sshWriteFile(server, workdir + '/data/' + ds.fileName, dsRawContent);
@@ -1662,7 +1673,7 @@ async function handleModelTrainingRequest(req, res) {
         const rlcd = buildRlcdTrainCommand(server, jobId, cfg, ds);
         // kev_rlcd_bridge 的输入是远端 data/<file>；输出到 rlcd-data/<jobId>/
         const prepCmd =
-          shq(rlcd.pyBin) + ' D:/llm-training/kev_rlcd_bridge.py' +
+          shq(rlcd.pyBin) + ' ' + shq(TRAINING_ROOT + '/kev_rlcd_bridge.py') +
           ' data/' + ds.fileName +
           ' rlcd-data/' + jobId +
           ' --calib-frac ' + shq(String(cfg.rlcdCalibFrac || 0.1)) +

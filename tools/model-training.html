@@ -1081,7 +1081,7 @@ body{font-family:-apple-system,'Microsoft YaHei','PingFang SC',sans-serif;backgr
             <label>基座模型 <span class="req">*</span></label>
             <input id="cfgModel" list="modelList" placeholder="如 Qwen/Qwen3-0.6B" oninput="onModelChange()">
             <datalist id="modelList">
-              <option value="D:/llm-training/models/Qwen3-0.6B">Qwen3-0.6B（本机已下载 ✓）</option>
+              <option value="">Qwen3-0.6B（在下方模型路径填本机下载路径）</option>
               <option value="Qwen/Qwen3-0.6B"></option>
               <option value="Qwen/Qwen3-4B-Instruct-2507"></option>
               <option value="Qwen/Qwen2.5-7B-Instruct"></option>
@@ -1625,16 +1625,16 @@ function openSrvModal() {
 }
 /** 一键添加本机为训练服务器（本地执行模式，无需 SSH） */
 async function addLocalServer() {
-  var workdir = prompt('本机训练工作目录（数据集/日志/产物存放处）：', 'D:/llm-training/ai-harbor-training');
+  var workdir = prompt('本机训练工作目录（数据集/日志/产物存放处）：', '');
   if (workdir === null) return;
-  var cliPath = prompt('llamafactory-cli 路径：', 'D:/llm-training/venv/Scripts/llamafactory-cli.exe');
+  var cliPath = prompt('llamafactory-cli 路径（如 /path/to/venv/Scripts/llamafactory-cli.exe）：', '');
   if (cliPath === null) return;
   try {
     var data = await api('/servers', 'POST', {
       local: true,
       name: '本机（localhost GPU）',
-      remoteWorkdir: workdir || 'D:/llm-training/ai-harbor-training',
-      cliPath: cliPath || 'D:/llm-training/venv/Scripts/llamafactory-cli.exe',
+      remoteWorkdir: workdir || '',
+      cliPath: cliPath || '',
     });
     toast('本机服务器已添加，正在测试…', 'ok');
     state.selectedServerId = data.server.id;

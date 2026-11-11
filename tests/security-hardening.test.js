@@ -75,9 +75,9 @@ check('控制字符被拒', function () {
 
 // ── 3. 路径沙箱 ──
 const { guardImportPath, configuredRoots } = require('../routes/path-guard');
-check('默认根目录内的路径放行（真实存在的文件）', function () {
-  const real = 'D:\\llm-training\\ai-harbor-training\\data';
-  assert.ok(fs.existsSync(real), '测试前置：该目录应存在');
+check('默认根目录内的路径放行（项目 data 目录）', function () {
+  const real = require('path').join(__dirname, '..', 'data');
+  assert.ok(fs.existsSync(real), '测试前置：data 目录应存在');
   const r = guardImportPath(real);
   assert.strictEqual(r.ok, true, JSON.stringify(r));
 });
@@ -87,33 +87,34 @@ check('根目录外的绝对路径被拒（C:/Windows）', function () {
   assert.ok(/允许的导入目录/.test(r.error));
 });
 check('根目录外的用户目录被拒', function () {
-  assert.strictEqual(guardImportPath('C:\\Users\\Administrator\\.ssh\\id_rsa').ok, false);
+  assert.strictEqual(guardImportPath('C:\\Users\\somebody\\.ssh\\id_rsa').ok, false);
 });
 check('.. 穿越被前置拒绝', function () {
-  const r = guardImportPath('D:\\llm-training\\..\\..\\etc\\passwd');
+  const dataDir = require('path').join(__dirname, '..', 'data');
+  const r = guardImportPath(dataDir + require('path').sep + '..' + require('path').sep + '..' + require('path').sep + 'etc' + require('path').sep + 'passwd');
   assert.strictEqual(r.ok, false);
   assert.ok(/\.\./.test(r.error));
 });
 check('不存在的路径被拒', function () {
-  const r = guardImportPath('D:\\llm-training\\no_such_dir_xyz\\a.json');
+  const r = guardImportPath('Z:\\no_such_dir_xyz\\a.json');
   assert.strictEqual(r.ok, false);
   assert.ok(/不存在/.test(r.error));
 });
 check('大小写与正斜杠变体归一后仍受白名单约束', function () {
-  // d:/LLM-TRAINING 与 D:/llm-training 是同一目录 → 放行
-  assert.strictEqual(guardImportPath('d:/LLM-Training/ai-harbor-training/data').ok, true);
+  // 白名单内目录（项目 data）
+  assert.strictEqual(guardImportPath(require('path').join(__dirname, '..', 'data')).ok, true);
   // d:/other 不在白名单 → 拒
-  assert.strictEqual(guardImportPath('d:/other/a.json').ok, false);
+  assert.strictEqual(guardImportPath('Z:/definitely/not/whitelisted/a.json').ok, false);
 });
 check('空路径被拒', function () {
   assert.strictEqual(guardImportPath('').ok, false);
   assert.strictEqual(guardImportPath('   ').ok, false);
 });
 check('DATASET_IMPORT_ROOTS 环境变量可覆盖白名单', function () {
-  process.env.DATASET_IMPORT_ROOTS = 'D:\\some\\custom\\root';
+  process.env.DATASET_IMPORT_ROOTS = 'Z:\\some\\custom\\root';
   try {
-    assert.strictEqual(guardImportPath('D:\\llm-training\\a.json').ok, false);
-    assert.strictEqual(configuredRoots()[0], 'D:\\some\\custom\\root');
+    assert.strictEqual(guardImportPath('Z:\\whatever\\a.json').ok, false);
+    assert.strictEqual(configuredRoots()[0], 'Z:\\some\\custom\\root');
   } finally { delete process.env.DATASET_IMPORT_ROOTS; }
 });
 
