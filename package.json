@@ -1,0 +1,14 @@
+{
+  "name": "model-builder",
+  "version": "1.0.0",
+  "description": "模型训练工作台：训练任务管理（LLaMA-Factory/kev/RLCD）· 数据集合成与质检 · 训练后自动评估 · 实验报告（AI Harbor 训练模块独立版）",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node tests/run-all.js"
+  },
+  "dependencies": {
+    "formidable": "^3.5.4",
+    "ssh2": "^1.17.0"
+  }
+}
