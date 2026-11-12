@@ -118,7 +118,9 @@ flowchart LR
 ## 测试
 
 ```bash
-npm test    # 12 套 190 项回归（含安全加固与 fail-closed 用例；2026-11-12 本机实测）
+npm test    # 12 套回归；干净 clone 基线 173 项，带本地 data/ 历史任务时 190 项（2026-11-12 实测）
+
+项数差异来自 `experiment-report-ui.test.js`：该套件依赖本地任务记录生成 loss 曲线，干净 clone 会跳过，见「已知限制」。
 ```
 
 ## 目录
@@ -138,6 +140,8 @@ training/                  训练环境：2 个 Python 运行时脚本 + 依赖/
 - RLCD 引擎暂只支持本机训练环境（脚本依赖 `TRAINING_ROOT` 布局，见 [training/README.md 已知限制](training/README.md#已知限制)）
 - 语义去重是 n-gram 近似，不等于语义级查重（同义不同词的重复检不出）
 - AI 叙述需要云 LLM 密钥（`QWEN_KEY` 等）；不配置时统计与图表完全可用
+- 干净 clone 缺少 `data/`（被 `.gitignore` 排除），`experiment-report-ui.test.js` 因无历史任务生成不了 loss 曲线，17 项断言会跳过；`npm test` 此时显示 173 项而非全量 190 项
+- `training/` 的 Python 脚本不在 `npm test` 覆盖范围内，补入后只做过无 GPU 冒烟验证，未在 GPU 上重跑完整训练
 
 ## License
 
