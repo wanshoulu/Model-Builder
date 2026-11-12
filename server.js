@@ -40,7 +40,12 @@ const MIME = {
 function serveStatic(req, res) {
   const u = new URL(req.url, 'http://localhost');
   let p = path.normalize(u.pathname).replace(/^([/\\])+/, '');
-  if (p === '' || p === '.') p = 'tools/model-training.html';   // 根路径直达工作台
+  // 根路径 302 到工具页（不用 readFile 直出：页面内 vendor/plotly 等相对路径
+  // 以浏览器地址为基准解析，URL 停留在 / 时会解析成 /vendor/... → 404）
+  if (p === '' || p === '.') {
+    res.writeHead(302, { Location: '/tools/model-training.html' });
+    return res.end();
+  }
   // 静态文件只允许 tools/ 内（白名单）：
   // .env（密钥）、data/（含 servers.json SSH 凭据与数据集）、源码与测试一律不可经 HTTP 读取。
   const rel = path.relative(path.join(__dirname, 'tools'), path.join(__dirname, p));
