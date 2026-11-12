@@ -43,10 +43,10 @@
 ```bash
 git clone https://github.com/wanshoulu/Model-Builder.git
 cd Model-Builder
-npm install && npm start     # → http://127.0.0.1:3000
+npm install && npm start     # → http://127.0.0.1:3011
 ```
 
-打开浏览器就是工作台首页（任务列表 + 新建训练任务向导）。训练执行需要一台 Python 训练环境（本机或 SSH 远端），全部环境变量见 `.env.example`。
+打开浏览器就是工作台首页（任务列表 + 新建训练任务向导）。默认端口 `3011` 而非 `3000`：本机 `3000` 通常是 AI Harbor 主站的端口，独立部署用不同端口可避免 `EADDRINUSE`；需改端口时设置 `PORT`。训练执行需要一台 Python 训练环境（本机或 SSH 远端），全部环境变量见 `.env.example`。
 
 ## 训练环境准备（提交真实训练才需要）
 

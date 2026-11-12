@@ -7,12 +7,12 @@
  *
  * 启动：
  *   npm install
- *   npm start            （默认 http://127.0.0.1:3000）
+ *   npm start            （默认 http://127.0.0.1:3011）
  *   PORT=8080 npm start
  *
  * 环境变量（均可选）：
  *   HOST          监听地址（默认 127.0.0.1；对外部署务必先配鉴权）
- *   PORT          端口（默认 3000）
+ *   PORT          端口（默认 3011；3000 通常被 AI Harbor 主站占用）
  *   QWEN_KEY 等   云 LLM 密钥（数据合成 / AI 报告用；见 config/api-keys.js）
  *
  * 本版本与 Harbor 主仓的差异：
@@ -24,7 +24,7 @@ const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
 
-const PORT = Number(process.env.PORT || 3000);
+const PORT = Number(process.env.PORT || 3011);
 const HOST = process.env.HOST || '127.0.0.1';
 
 const { handleModelTrainingRequest } = require('./routes/model-training');
@@ -67,6 +67,7 @@ const server = http.createServer(async function (req, res) {
   const u = new URL(req.url, 'http://localhost');
   const pathname = u.pathname;
   try {
+    if (pathname === '/favicon.ico') { res.writeHead(204); return res.end(); }
     if (pathname.startsWith('/api/model-training/')) return await handleModelTrainingRequest(req, res);
     if (pathname.startsWith('/api/dataset-tools/')) return await handleDatasetToolsRequest(req, res);
     if (pathname.startsWith('/api/experiment-report/')) return await handleExperimentReportRequest(req, res);
