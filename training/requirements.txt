@@ -1,0 +1,21 @@
+# Model-Builder 训练环境依赖（Python >= 3.11）
+#
+# 版本下限来自 rlcd-lite/pyproject.toml（Apache-2.0）：
+#   https://github.com/arnabgho/rlcd-lite/blob/main/pyproject.toml
+# train_rlcd.py / kev_rlcd_bridge.py 通过 sys.path 直接加载 rlcd-lite/src，
+# 因此这里列的是「不安装 rlcd-lite 包本身」时，其源码所需的最小依赖集合。
+#
+# 若同环境还要跑 LLaMA-Factory，请按官方 README 另行安装：
+#   https://github.com/hiyouga/LLaMA-Factory#installation
+# （其 Requirement 表要求 python>=3.11、torch>=2.0.0、transformers>=4.49.0、
+#   peft>=0.14.0、accelerate>=0.34.0、trl>=0.8.6，与本文件版本区间兼容）
+
+numpy>=1.26
+torch>=2.3
+transformers>=4.45
+peft>=0.13
+accelerate>=0.30
+
+# 可选：rlcd-lite 的 data / eval extras（加载 HuggingFace 数据集、绘制可靠性图）
+# datasets>=3.0
+# matplotlib>=3.8

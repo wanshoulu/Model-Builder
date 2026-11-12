@@ -48,6 +48,18 @@ npm install && npm start     # → http://127.0.0.1:3000
 
 打开浏览器就是工作台首页（任务列表 + 新建训练任务向导）。训练执行需要一台 Python 训练环境（本机或 SSH 远端），全部环境变量见 `.env.example`。
 
+## 训练环境准备（提交真实训练才需要）
+
+工作台本体是 Node 单进程，只做编排；真正跑 LoRA / GRPO 的是 `training/` 里的两个 Python 脚本（`train_rlcd.py`、`kev_rlcd_bridge.py`）。仓库已自带它们，第三方引擎、模型权重与 venv 需自行安装：
+
+```bash
+cd training
+git clone --depth 1 https://github.com/arnabgho/rlcd-lite.git rlcd-lite
+python -m venv venv && venv/bin/pip install -r requirements.txt
+```
+
+然后在项目根目录的 `.env` 里设 `TRAINING_ROOT=./training`。三个训练引擎（LLaMA-Factory / kev / rlcd-lite）各自的安装项、目录约定与已知限制见 [training/README.md](training/README.md)。只想体验数据集合成、质检与实验报告，不需要装这些。
+
 ## 渐进式使用
 
 **第一步：体验界面与质检（不需要训练环境）**
@@ -93,7 +105,7 @@ flowchart LR
 |---|---|
 | SFT | Supervised Fine-Tuning，指令微调（alpaca 格式 instruction/output） |
 | decision 数据 | 决策格式样本：`state`（用户话语）+ `questions`（追问选项树），kev 引擎的多问题输出用 |
-| RLCD | Reinforcement Learning from Contrastive Divergence，对比散度强化学习（rlcd-lite 实现） |
+| RLCD | RL for Calibrated Decisions，面向校准决策的强化学习（[rlcd-lite](https://github.com/arnabgho/rlcd-lite) 实现）。rlcd-lite 官方声明：它既不是 TypeSafe 未公开的 RLCD 算法，也与 Yang et al. 2023 的 Contrastive Distillation 无关 |
 | 质检漏斗 | 七段串行过滤器，任一段剔除即出局，输出每段计数与通过率 |
 | 语义去重 | 3-gram Jaccard ≥ 0.85 判为重复（decision 样本指纹只用 state，避免模板字段误杀） |
 | 泄漏隔离 | 训练集与评测集做指纹比对，重复样本自动剔除并计数 |
@@ -101,10 +113,12 @@ flowchart LR
 | record-level bootstrap | 按独立记录重采样 1000 次求区间，一条记录多问题时区间更诚实（更宽） |
 | 断点续训 | LLaMA-Factory resume：从上次 checkpoint 的 optimizer 状态继续 |
 
+训练环境侧名词（LLaMA-Factory / kev / rlcd-lite / GRPO / TRAINING_ROOT）见 [training/README.md 名词表](training/README.md#名词表)。
+
 ## 测试
 
 ```bash
-npm test    # 12 套 173 项回归（含安全加固与 fail-closed 用例）
+npm test    # 12 套 190 项回归（含安全加固与 fail-closed 用例；2026-11-12 本机实测）
 ```
 
 ## 目录
@@ -115,12 +129,13 @@ routes/                    11 个路由模块（训练/数据集/评估/报告/�
 tools/model-training.html  单页前端（内嵌样式与脚本，零构建）
 tools/vendor/plotly.min.js Plotly 本地化（MIT，随仓库分发）
 tests/                     12 套测试 + run-all 启动器
+training/                  训练环境：2 个 Python 运行时脚本 + 依赖/模板/样例（见 training/README.md）
 ```
 
 ## 已知限制
 
 - 免登录设计，默认只听 127.0.0.1；公网部署需自行加反向代理鉴权
-- RLCD 引擎暂只支持本机训练环境（脚本依赖 `TRAINING_ROOT` 布局）
+- RLCD 引擎暂只支持本机训练环境（脚本依赖 `TRAINING_ROOT` 布局，见 [training/README.md 已知限制](training/README.md#已知限制)）
 - 语义去重是 n-gram 近似，不等于语义级查重（同义不同词的重复检不出）
 - AI 叙述需要云 LLM 密钥（`QWEN_KEY` 等）；不配置时统计与图表完全可用
 

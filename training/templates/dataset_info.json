@@ -1,0 +1,10 @@
+{
+  "bank_qa_demo": {
+    "file_name": "bank_qa_demo.json",
+    "columns": {
+      "prompt": "instruction",
+      "query": "input",
+      "response": "output"
+    }
+  }
+}

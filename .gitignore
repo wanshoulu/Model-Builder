@@ -3,3 +3,18 @@ data/
 *.log
 .env
 .DS_Store
+
+# 训练环境：本地安装与运行产物，体积达 GB 级且含真实数据，不入库
+# 运行时脚本、依赖清单与配置模板已入库，见 training/README.md
+training/rlcd-lite/
+training/venv/
+training/models/
+training/ai-harbor-training/
+training/rlcd-data/
+training/jobs/
+training/logs/
+training/run/
+training/saves/
+training/evals/
+__pycache__/
+*.pyc

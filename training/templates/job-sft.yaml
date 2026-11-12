@@ -1,0 +1,44 @@
+# LLaMA-Factory SFT 配置模板（离线排查 / 手工训练参考）
+#
+# 工作台本身会在提交任务时按表单生成 YAML（POST /api/model-training/config/preview），
+# 不读取本文件。这里的用途是：脱离工作台手工复现一次训练，或核对工作台生成的字段。
+#
+# 使用前替换：model_name_or_path（本机权重目录或 HuggingFace 模型 ID）、
+#             dataset（须在 data/dataset_info.json 里注册）、output_dir（任务 ID）。
+# 路径一律相对 TRAINING_WORKDIR，避免把本机绝对路径写进版本库。
+
+### model
+model_name_or_path: Qwen/Qwen3-0.6B
+trust_remote_code: true
+
+### method
+stage: sft
+do_train: true
+finetuning_type: lora
+lora_target: all
+lora_rank: 8
+lora_alpha: 16
+
+### dataset
+dataset: bank_qa_demo
+template: qwen3_nothink
+cutoff_len: 1024
+preprocessing_num_workers: 8
+dataloader_num_workers: 0
+
+### output
+output_dir: saves/REPLACE_WITH_JOB_ID
+logging_steps: 5
+save_steps: 50
+plot_loss: true
+overwrite_output_dir: true
+report_to: none
+
+### train
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 2
+learning_rate: 0.00005
+num_train_epochs: 3
+lr_scheduler_type: cosine
+warmup_ratio: 0.1
+bf16: true
