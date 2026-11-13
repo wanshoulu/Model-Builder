@@ -1,106 +1,131 @@
 'use strict';
 
-const fs = require('fs');
-
 /**
- * API Keys — 模型路由注册表（单一事实来源）
+ * API Keys — Single source of truth
  *
- * 所有 LLM 访问（tools/llm-client.js、services/intent-draft-trial.js）都从这里取路由与密钥。
+ * All AI model routes and keys are configured HERE.
+ * Every tool (server, graph-generator, ppt-converter, etc.) imports from this file.
  *
- * 密钥一律通过环境变量注入，本仓库不提交任何真实密钥：
+ * Environment variables override dev defaults:
  *   DEEPSEEK_KEY  — DeepSeek API key
  *   QWEN_KEY      — Qwen / DashScope API key
  *   KIMI_KEY      — Kimi / Moonshot API key
- *   GLM_KEY       — Zhipu GLM API key
+ *   GLM_KEY       — Zhipu GLM coding plan API key
  *   VOLCANO_KEY   — Volcano (ByteDance) API key (format: id:secret)
  *
- * 配置方式：复制 .env.example → .env（或直接 export），按需填入至少一个 key。
- * 未配置任何 key 时服务可启动，但 AI 辅助功能（AI 映射/抽取/试算）会在调用时
- * 返回明确的 MISSING_KEY 错误；模板校验、草稿管理、应用/回滚等离线能力不受影响。
+ * Optional web search providers used by tools/web-search-providers.js:
+ *   WEB_SEARCH_PROVIDERS   — comma order, default: searxng,gdelt,brave,tavily,exa,serper,jina
+ *   SEARXNG_URL            — free/self-hosted SearXNG endpoint, e.g. http://localhost:8888
+ *   gdelt                  — free no-key news/public-media provider, configured by provider order only
+ *   BRAVE_SEARCH_API_KEY   — Brave Search API
+ *   JINA_API_KEY           — optional higher-rate Jina Search key; s.jina.ai can work without it
+ *   TAVILY_API_KEY         — Tavily Search API
+ *   EXA_API_KEY            — Exa Search API
+ *   SERPER_API_KEY         — Serper Google SERP API
+ *   llm_search_assist      — optional model-assisted lead generation; not a trusted retrieval source
+ *
+ * Dev defaults kick in when DEV_MODE=true or NODE_ENV=development.
+ * In production, missing keys cause clear errors.
  */
+
+// 密钥一律通过环境变量注入，本仓库不提交任何真实密钥（历史版本曾把开发密钥烤进
+// DEV_KEYS——2026-11-13 已彻底移除；部署时用 --env-file 或 .env 注入，见 .env.example）
+const DEV_MODE = process.env.DEV_MODE === 'true' || process.env.NODE_ENV === 'development' || !process.env.NODE_ENV;
+
 
 const API_ROUTES = {
   'deepseek-chat': {
     host: 'api.deepseek.com',
     path: '/v1/chat/completions',
     model: 'deepseek-chat',
-    getKey: () => process.env.DEEPSEEK_KEY,
+    getKey: () => process.env.DEEPSEEK_KEY ,
     provider: 'deepseek',
   },
   'deepseek-v4-pro': {
     host: 'api.deepseek.com',
     path: '/v1/chat/completions',
     model: 'deepseek-v4-pro',
-    getKey: () => process.env.DEEPSEEK_KEY,
+    getKey: () => process.env.DEEPSEEK_KEY ,
     provider: 'deepseek',
   },
   'deepseek-v4-flash': {
     host: 'api.deepseek.com',
     path: '/v1/chat/completions',
     model: 'deepseek-v4-flash',
-    getKey: () => process.env.DEEPSEEK_KEY,
+    getKey: () => process.env.DEEPSEEK_KEY ,
     provider: 'deepseek',
   },
   'qwen-plus': {
     host: 'dashscope.aliyuncs.com',
     path: '/compatible-mode/v1/chat/completions',
-    getKey: () => process.env.QWEN_KEY,
+    getKey: () => process.env.QWEN_KEY ,
+    provider: 'qwen',
+  },
+  'qwen3.8-flash': {
+    // 千问AI平台 MaaS 端点（与百炼同 key 体系）。2026-11 平台最新 flash，
+    // 默认优先调用（PRIORITY 首位）。
+    host: 'maas.qianwenaiapi.com',
+    path: '/compatible-mode/v1/chat/completions',
+    model: 'qwen3.8-flash',
+    getKey: () => process.env.QWEN_KEY ,
+    provider: 'qwen',
+  },
+  'qwen3.7-flash': {
+    // 千问AI平台 MaaS 端点（与百炼同 key 体系）。思考开关同时接受
+    // enable_thinking:boolean 与 thinking:{type:...} 两种方言，网关的
+    // DeepSeek 风格透传可直接命中。
+    host: 'maas.qianwenaiapi.com',
+    path: '/compatible-mode/v1/chat/completions',
+    getKey: () => process.env.QWEN_KEY ,
     provider: 'qwen',
   },
   'qwen-vl': {
     host: 'dashscope.aliyuncs.com',
     path: '/compatible-mode/v1/chat/completions',
-    getKey: () => process.env.QWEN_KEY,
-    provider: 'qwen',
-  },
-  'qwen3.7-flash': {
-    host: 'dashscope.aliyuncs.com',
-    path: '/compatible-mode/v1/chat/completions',
-    model: 'qwen3.7-flash',
-    getKey: () => process.env.QWEN_KEY,
+    getKey: () => process.env.QWEN_KEY ,
     provider: 'qwen',
   },
   'kimi-vl': {
     host: 'api.moonshot.cn',
     path: '/v1/chat/completions',
     model: 'kimi-k2.6',
-    getKey: () => process.env.KIMI_KEY,
+    getKey: () => process.env.KIMI_KEY ,
     provider: 'kimi',
   },
   'kimi-latest': {
     host: 'api.moonshot.cn',
     path: '/v1/chat/completions',
     model: 'kimi-latest',
-    getKey: () => process.env.KIMI_KEY,
+    getKey: () => process.env.KIMI_KEY ,
     provider: 'kimi',
   },
-  // GLM（订阅制）— 注意必须用 coding 专属端点，通用端点会扣账户余额
+  // GLM Coding Plan（订阅制）— 注意必须用 coding 专属端点，通用端点会扣账户余额
   'glm-coding': {
     host: 'open.bigmodel.cn',
     path: '/api/coding/paas/v4/chat/completions',
     model: 'GLM-4.6',
-    getKey: () => process.env.GLM_KEY,
+    getKey: () => process.env.GLM_KEY ,
     provider: 'glm',
   },
   'glm-4.6': {
     host: 'open.bigmodel.cn',
-    path: '/api/paas/v4/chat/completions',
+    path: '/api/coding/paas/v4/chat/completions',
     model: 'GLM-4.6',
-    getKey: () => process.env.GLM_KEY,
+    getKey: () => process.env.GLM_KEY ,
     provider: 'glm',
   },
   'glm-5.2': {
     host: 'open.bigmodel.cn',
     path: '/api/paas/v4/chat/completions',
     model: 'glm-5.2',
-    getKey: () => process.env.GLM_KEY,
+    getKey: () => process.env.GLM_KEY ,
     provider: 'glm',
   },
   'text-embedding-v4': {
     host: 'dashscope.aliyuncs.com',
     path: '/compatible-mode/v1/embeddings',
     model: 'qwen3.7-text-embedding-flash',
-    getKey: () => process.env.QWEN_KEY,
+    getKey: () => process.env.QWEN_KEY ,
     provider: 'qwen',
     dim: 1024,
     batchSize: 10,
@@ -109,7 +134,7 @@ const API_ROUTES = {
     host: 'dashscope.aliyuncs.com',
     path: '/compatible-mode/v1/embeddings',
     model: 'qwen3.7-text-embedding-flash',
-    getKey: () => process.env.QWEN_KEY,
+    getKey: () => process.env.QWEN_KEY ,
     provider: 'qwen',
     dim: 1024,
     batchSize: 10,
@@ -119,21 +144,21 @@ const API_ROUTES = {
     host: 'st8tp3ajl0df3n8b8l8qu.apigateway-cn-beijing.volceapi.com',
     path: '/v1/chat/completions',
     model: 'doubao-pro-32k',
-    getKey: () => process.env.VOLCANO_KEY,
+    getKey: () => process.env.VOLCANO_KEY ,
     provider: 'volcano',
   },
   'doubao-pro-128k': {
     host: 'st8tp3ajl0df3n8b8l8qu.apigateway-cn-beijing.volceapi.com',
     path: '/v1/chat/completions',
     model: 'doubao-pro-128k',
-    getKey: () => process.env.VOLCANO_KEY,
+    getKey: () => process.env.VOLCANO_KEY ,
     provider: 'volcano',
   },
   'doubao-lite-32k': {
     host: 'st8tp3ajl0df3n8b8l8qu.apigateway-cn-beijing.volceapi.com',
     path: '/v1/chat/completions',
     model: 'doubao-lite-32k',
-    getKey: () => process.env.VOLCANO_KEY,
+    getKey: () => process.env.VOLCANO_KEY ,
     provider: 'volcano',
   },
 };
@@ -159,6 +184,7 @@ const DEFAULT_CHAT_MODEL = 'deepseek-v4-pro';
 
 module.exports = {
   API_ROUTES,
+  DEV_MODE,
   DEFAULT_CHAT_MODEL,
   getAvailableModels,
   getMissingKeys,

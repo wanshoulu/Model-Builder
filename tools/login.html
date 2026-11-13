@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>登录 - 模型训练工作台</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body {
+    font-family: "PingFang SC", "Microsoft YaHei", -apple-system, "Segoe UI", sans-serif;
+    background: radial-gradient(1200px 600px at 20% -10%, #1b2333 0%, #0d1117 55%, #090c12 100%);
+    color: #e6edf3;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 100vh;
+  }
+  .card {
+    width: 380px;
+    max-width: calc(100vw - 32px);
+    background: #131a26;
+    border: 1px solid #2a3547;
+    border-radius: 12px;
+    padding: 32px 28px;
+    box-shadow: 0 16px 48px rgba(0,0,0,.45);
+  }
+  .logo { text-align: center; margin-bottom: 24px; }
+  .logo .mark {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 48px; height: 48px; border-radius: 12px;
+    background: linear-gradient(135deg, #2f6fed, #7c3aed);
+    font-size: 24px; margin-bottom: 12px;
+  }
+  .logo h1 { font-size: 18px; font-weight: 600; letter-spacing: .5px; }
+  .logo p { font-size: 12px; color: #8b98a9; margin-top: 6px; }
+  label { display: block; font-size: 13px; color: #9fb0c3; margin: 0 0 8px; }
+  input {
+    width: 100%; padding: 11px 12px; font-size: 14px;
+    background: #0d1420; color: #e6edf3;
+    border: 1px solid #2a3547; border-radius: 8px; outline: none;
+    transition: border-color .15s;
+  }
+  input:focus { border-color: #2f6fed; }
+  .field + .field { margin-top: 14px; }
+  button {
+    width: 100%; margin-top: 20px; padding: 11px;
+    font-size: 14px; font-weight: 600; color: #fff;
+    background: linear-gradient(135deg, #2f6fed, #2456c4);
+    border: none; border-radius: 8px; cursor: pointer;
+    transition: filter .15s;
+  }
+  button:hover { filter: brightness(1.1); }
+  button:disabled { opacity: .6; cursor: not-allowed; }
+  .msg { margin-top: 14px; font-size: 13px; min-height: 18px; text-align: center; }
+  .msg.err { color: #f87171; }
+  .hint { margin-top: 18px; font-size: 12px; color: #64748b; line-height: 1.7; border-top: 1px solid #2a3547; padding-top: 14px; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="logo">
+      <div class="mark">🚂</div>
+      <h1>模型训练工作台</h1>
+      <p>LLaMA-Factory 远程训练控制台</p>
+    </div>
+    <form id="f">
+      <div class="field">
+        <label for="username">用户名</label>
+        <input id="username" type="text" autocomplete="username" placeholder="用户名" autofocus>
+      </div>
+      <div class="field">
+        <label for="password">密码</label>
+        <input id="password" type="password" autocomplete="current-password" placeholder="密码">
+      </div>
+      <button id="btn" type="submit">登 录</button>
+    </form>
+    <div class="msg" id="msg"></div>
+    <div class="hint">
+      账号密码由服务器配置（MT_USERNAME / MT_PASSWORD）。<br>
+      登录一次后 180 天内免登。
+    </div>
+  </div>
+<script>
+(function () {
+  var params = new URLSearchParams(location.search);
+  var next = params.get('next') || '/tools/model-training.html';
+  if (!/^\/[A-Za-z0-9._\-\/]*$/.test(next)) next = '/tools/model-training.html';
+  var msg = document.getElementById('msg');
+  var btn = document.getElementById('btn');
+  var userInput = document.getElementById('username');
+  var passInput = document.getElementById('password');
+
+  function tryLogin(username, password) {
+    msg.className = 'msg'; msg.textContent = '验证中…';
+    btn.disabled = true;
+    fetch('/api/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: username, password: password })
+    }).then(function (r) {
+      return r.json().then(function (j) { return { status: r.status, body: j }; });
+    }).then(function (r) {
+      if (r.status === 200 && r.body.ok) {
+        // cookie 由服务端下发（HttpOnly），浏览器自动携带，无需 JS 设置
+        msg.style.color = '#4ade80'; msg.textContent = '登录成功，正在跳转…';
+        setTimeout(function () { location.replace(next); }, 300);
+      } else {
+        msg.className = 'msg err'; msg.textContent = (r.body && r.body.error) || '用户名或密码错误';
+        btn.disabled = false; passInput.focus(); passInput.select();
+      }
+    }).catch(function () {
+      msg.className = 'msg err'; msg.textContent = '网络错误，请稍后重试';
+      btn.disabled = false;
+    });
+  }
+
+  document.getElementById('f').addEventListener('submit', function (e) {
+    e.preventDefault();
+    var u = userInput.value.trim();
+    var p = passInput.value;
+    if (!u || !p) { msg.className = 'msg err'; msg.textContent = '请输入用户名和密码'; return; }
+    tryLogin(u, p);
+  });
+
+  userInput.focus();
+})();
+</script>
+</body>
+</html>

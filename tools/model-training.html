@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>模型训练工作台 | Model-Builder</title>
+<title>模型训练工作台 | AI Harbor</title>
 <style>
 :root {
   --bg:#f7f8fa; --card:#fff; --border:#e6e9ef; --border2:#d4d9e2;
@@ -27,8 +27,8 @@ body{font-family:-apple-system,'Microsoft YaHei','PingFang SC',sans-serif;backgr
 .topbar .sub{font-size:12px;color:var(--text3)}
 .topbar .spacer{flex:1}
 .topbar .engine{font-size:11px;color:var(--text2);background:var(--soft);border:1px solid var(--border);padding:3px 10px;border-radius:20px}
-.topbar .home{font-size:12px;color:var(--text2);text-decoration:none;border:1px solid var(--border);padding:4px 12px;border-radius:6px;background:var(--card)}
-.topbar .home:hover{color:var(--blue);border-color:var(--blue)}
+.topbar a.home{font-size:12px;color:var(--text2);text-decoration:none;border:1px solid var(--border);padding:4px 12px;border-radius:6px;background:var(--card)}
+.topbar a.home:hover{color:var(--blue);border-color:var(--blue)}
 
 /* ── 布局 ── */
 .wrap{max-width:1180px;margin:0 auto;padding:24px 22px 80px}
@@ -474,7 +474,7 @@ body{font-family:-apple-system,'Microsoft YaHei','PingFang SC',sans-serif;backgr
   </div>
   <div class="spacer"></div>
   <span class="engine">引擎：LLaMA-Factory</span>
-  <span class="home">Model-Builder</span>
+  <a class="home" href="/">← AI Harbor</a>
 </div>
 
 <div class="wrap">
@@ -980,7 +980,7 @@ body{font-family:-apple-system,'Microsoft YaHei','PingFang SC',sans-serif;backgr
           </select>
         </div>
         <div class="field" id="synModelField"><label>模型</label>
-          <input id="synModel" placeholder="留空自动（qwen3.7-flash 优先）">
+          <input id="synModel" placeholder="留空自动（qwen3.8-flash 优先）">
           <div class="hint" id="synBackendHint"></div>
         </div>
         <div class="field hidden" id="synBaseUrlField"><label>自建 API 地址</label>
@@ -1081,7 +1081,7 @@ body{font-family:-apple-system,'Microsoft YaHei','PingFang SC',sans-serif;backgr
             <label>基座模型 <span class="req">*</span></label>
             <input id="cfgModel" list="modelList" placeholder="如 Qwen/Qwen3-0.6B" oninput="onModelChange()">
             <datalist id="modelList">
-              <option value="">Qwen3-0.6B（在下方模型路径填本机下载路径）</option>
+              <option value="D:/llm-training/models/Qwen3-0.6B">Qwen3-0.6B（本机已下载 ✓）</option>
               <option value="Qwen/Qwen3-0.6B"></option>
               <option value="Qwen/Qwen3-4B-Instruct-2507"></option>
               <option value="Qwen/Qwen2.5-7B-Instruct"></option>
@@ -1351,6 +1351,11 @@ body{font-family:-apple-system,'Microsoft YaHei','PingFang SC',sans-serif;backgr
         <input id="srvWorkdir" value="~/ai-harbor-training">
         <div class="hint">数据集/配置/日志/产物的存放根目录</div>
       </div>
+      <div class="field wide">
+        <label>python 解释器（可选）</label>
+        <input id="srvPyBin" placeholder="如 /root/miniconda3/envs/lf/bin/python；留空则远端用 python3">
+        <div class="hint">评估/对话/合成用的 python；conda 环境建议填完整路径（pythonBin）</div>
+      </div>
     </div>
     <div class="actions">
       <button class="btn btn-ghost" onclick="testSrv()">🔌 测试连接</button>
@@ -1511,6 +1516,10 @@ async function api(path, method, body) {
   var opts = { method: method || 'GET', headers: { 'Content-Type': 'application/json' } };
   if (body !== undefined) opts.body = JSON.stringify(body);
   var r = await fetch('/api/model-training' + path, opts);
+  if (r.status === 401) {
+    location.href = '/tools/login.html?next=' + encodeURIComponent(location.pathname);
+    throw new Error('未授权：请先登录');
+  }
   var data = null;
   try { data = await r.json(); } catch (e) { data = null; }
   if (!r.ok || (data && data.ok === false)) {
@@ -1619,22 +1628,22 @@ function openSrvModal() {
   state.editingSrvId = null;
   $('srvModalTitle').textContent = '添加训练服务器';
   ['srvName', 'srvHost', 'srvPass', 'srvKey'].forEach(function (i) { $(i).value = ''; });
-  $('srvPort').value = 22; $('srvUser').value = ''; $('srvWorkdir').value = '~/ai-harbor-training';
+  $('srvPort').value = 22; $('srvUser').value = ''; $('srvWorkdir').value = '~/ai-harbor-training'; $('srvPyBin').value = '';
   $('srvTestResult').classList.add('hidden');
   openModal('srvModal');
 }
 /** 一键添加本机为训练服务器（本地执行模式，无需 SSH） */
 async function addLocalServer() {
-  var workdir = prompt('本机训练工作目录（数据集/日志/产物存放处）：', '');
+  var workdir = prompt('本机训练工作目录（数据集/日志/产物存放处）：', '~/ai-harbor-training');
   if (workdir === null) return;
-  var cliPath = prompt('llamafactory-cli 路径（如 /path/to/venv/Scripts/llamafactory-cli.exe）：', '');
+  var cliPath = prompt('llamafactory-cli 路径（留空则使用 PATH 中的 llamafactory-cli）：', '');
   if (cliPath === null) return;
   try {
     var data = await api('/servers', 'POST', {
       local: true,
       name: '本机（localhost GPU）',
-      remoteWorkdir: workdir || '',
-      cliPath: cliPath || '',
+      remoteWorkdir: workdir || '~/ai-harbor-training',
+      cliPath: cliPath.trim() || undefined,
     });
     toast('本机服务器已添加，正在测试…', 'ok');
     state.selectedServerId = data.server.id;
@@ -1652,6 +1661,7 @@ function editSrv(id) {
   $('srvPass').value = ''; $('srvPass').placeholder = s.hasPassword ? '（已保存，留空则不修改）' : 'SSH 密码';
   $('srvKey').value = ''; $('srvKey').placeholder = s.hasPrivateKey ? '（私钥已保存，留空则不修改）' : '-----BEGIN OPENSSH PRIVATE KEY-----\n（粘贴私钥内容，优先于密码）';
   $('srvWorkdir').value = s.remoteWorkdir || '~/ai-harbor-training';
+  $('srvPyBin').value = s.pythonBin || '';
   $('srvTestResult').classList.add('hidden');
   openModal('srvModal');
 }
@@ -1665,6 +1675,7 @@ async function saveSrv() {
     password: $('srvPass').value || undefined,
     privateKey: $('srvKey').value.trim() || undefined,
     remoteWorkdir: $('srvWorkdir').value.trim() || '~/ai-harbor-training',
+    pythonBin: $('srvPyBin').value.trim() || undefined,
   };
   if (!p.host || !p.username) { toast('主机和用户名必填', 'err'); return; }
   try {

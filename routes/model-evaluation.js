@@ -19,11 +19,74 @@
 
 'use strict';
 
+const fs = require('node:fs');
+const path = require('node:path');
+const STORE = require('./json-store');
 const M = require('./eval-metrics');
 
 const TASKS = new Map();      // taskId -> { id, jobId, state, progress, ... }
 const TASK_TTL_MS = 6 * 60 * 60 * 1000;
 const MAX_TASKS = 60;
+
+// ── 任务持久化（对标 dataset-synthesis 的 synth-tasks 落盘模式）──────────
+// 历史缺陷：TASKS 只在内存——服务重启时运行中的评估任务直接消失，
+// job.evaluation 永远停在 running。落盘后：重启恢复历史记录（可查），
+// running 中的任务标记 interrupted（后台协程已不存在，不假装还在跑）。
+const EVAL_TASKS_DIR = path.join(__dirname, '..', 'data', 'model-training', 'eval-tasks');
+try { fs.mkdirSync(EVAL_TASKS_DIR, { recursive: true }); } catch (e) {}
+const EVAL_TASK_ID_RE = /^evaltask-[a-z0-9]+$/;
+const EVAL_FILE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+function evalTaskFile(id) { return path.join(EVAL_TASKS_DIR, id + '.json'); }
+function isEvalTaskId(id) { return EVAL_TASK_ID_RE.test(String(id == null ? '' : id)); }
+
+// 落盘只保留可序列化字段（密钥/内部引用一律不写）
+function serializeEvalTask(t) {
+  const o = {};
+  for (const [k, v] of Object.entries(t)) {
+    if (k.startsWith('_')) continue;
+    if (/apiKey|secret|token|password/i.test(k)) continue;
+    if (v === undefined) continue;
+    try { JSON.stringify(v); o[k] = v; } catch (e) { /* 不可序列化字段跳过 */ }
+  }
+  return o;
+}
+function persistEvalTask(t) {
+  if (!isEvalTaskId(t.id)) return;
+  try { STORE.writeJsonSync(evalTaskFile(t.id), serializeEvalTask(t)); } catch (e) { /* 落盘失败不阻断评估 */ }
+}
+function readEvalTaskFile(id) {
+  if (!isEvalTaskId(id)) return null;
+  try {
+    const o = STORE.readJson(evalTaskFile(id), null);
+    return o && o.id === id ? o : null;
+  } catch (e) { return null; }
+}
+
+// 启动时恢复：running/pending 的任务标记 interrupted（后台协程已随旧进程死亡）
+function loadPersistedEvalTasks() {
+  let files = [];
+  try { files = fs.readdirSync(EVAL_TASKS_DIR).filter(f => /^evaltask-[a-z0-9]+\.json$/.test(f)); } catch (e) { return; }
+  const cutoff = Date.now() - EVAL_FILE_TTL_MS;
+  for (const f of files) {
+    const id = f.slice(0, -5);
+    const o = readEvalTaskFile(id);
+    if (!o) continue;
+    if (o.finishedAt && o.finishedAt < cutoff) {
+      try { fs.unlinkSync(evalTaskFile(id)); } catch (e) {}
+      continue;
+    }
+    if (o.state === 'running' || o.state === 'queued' || o.state === 'cancelling') {
+      o.state = 'interrupted';
+      o.error = '服务重启导致评估中断：后台推理协程已不存在，请重新发起评估';
+      o.finishedAt = Date.now();
+      STORE.writeJsonSync(evalTaskFile(id), o);
+    }
+    if (TASKS.size < MAX_TASKS) TASKS.set(id, o);
+  }
+}
+loadPersistedEvalTasks();
+
 
 function newId(prefix) {
   return prefix + '-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
@@ -344,13 +407,29 @@ function assembleResult(ctx) {
 
 // ── 任务化执行 ──────────────────────────────────────────────────────────
 
-function getTask(id) { return TASKS.get(id) || null; }
-function listTasks() { pruneTasks(); return Array.from(TASKS.values()).map(function (t) { return Object.assign({}, t); }); }
+function getTask(id) { return TASKS.get(id) || readEvalTaskFile(id); }
+function listTasks() {
+  pruneTasks();
+  // 磁盘上的历史任务也纳入列表（内存 Map 只有最近 MAX_TASKS 个）
+  const seen = new Set();
+  const out = [];
+  Array.from(TASKS.values()).forEach(function (t) { seen.add(t.id); out.push(Object.assign({}, t)); });
+  try {
+    const files = fs.readdirSync(EVAL_TASKS_DIR).filter(f => /^evaltask-[a-z0-9]+\.json$/.test(f));
+    for (const f of files) {
+      const id = f.slice(0, -5);
+      if (seen.has(id)) continue;
+      const o = readEvalTaskFile(id);
+      if (o) out.push(o);
+    }
+  } catch (e) { /* 目录读取失败忽略 */ }
+  return out;
+}
 
 function cancelTask(id) {
   const t = TASKS.get(id);
   if (!t) return false;
-  if (t.state === 'running') { t.cancelled = true; t.state = 'cancelling'; }
+  if (t.state === 'running') { t.cancelled = true; t.state = 'cancelling'; persistEvalTask(t); }
   return true;
 }
 
@@ -366,14 +445,17 @@ function startEvaluation(job, opts, io) {
     startedAt: now(), finishedAt: null, result: null, error: null, cancelled: false,
     auto: !!opts.auto };
   TASKS.set(taskId, task);
+  persistEvalTask(task);
   setImmediate(function () { run(task, job, opts, io).catch(function (e) {
     task.state = 'failed'; task.error = String((e && e.message) || e); task.finishedAt = now();
+    persistEvalTask(task);
   }); });
   return task;
 }
 
 async function run(task, job, opts, io) {
   task.state = 'running';
+  persistEvalTask(task);
   const startedAt = now();
   let current = io.readJob(job.id) || job;
   const previous = current.evaluation || null;
@@ -436,6 +518,7 @@ async function run(task, job, opts, io) {
     if (!io.readJob(job.id)) {
       task.state = 'failed'; task.error = '任务记录已被删除，评估结果不落盘';
       task.finishedAt = now(); task.progress = '失败';
+      persistEvalTask(task);
       return;
     }
     current = io.readJob(job.id);
@@ -444,12 +527,14 @@ async function run(task, job, opts, io) {
     await io.saveJob(Object.assign({}, current, { evaluation: result, evaluationHistory: history }));
     task.state = 'succeeded'; task.result = result; task.finishedAt = now();
     task.progress = '完成';
+    persistEvalTask(task);
   } catch (e) {
     // 失败不覆盖训练状态，也不抹掉上一次成功的评估结果
     const cur = io.readJob(job.id) || job;
     if (cur === job) {
       task.state = 'failed'; task.error = '任务记录已被删除，评估结果不落盘';
       task.finishedAt = now(); task.progress = '失败';
+      persistEvalTask(task);
       return;
     }
     // markRunning 已把状态改成 running，不能用它当基准；用启动前快照恢复上一次成功结果
@@ -463,6 +548,7 @@ async function run(task, job, opts, io) {
     }));
     task.state = 'failed'; task.error = String((e && e.message) || e); task.finishedAt = now();
     task.progress = '失败';
+    persistEvalTask(task);
   }
 }
 

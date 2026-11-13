@@ -23,7 +23,7 @@
  *   POST /api/model-training/jobs/:id/export         生成合并导出命令说明（merge_lora）
  *
  * 数据落盘：data/model-training/
- *   servers.json     服务器配置（密码以明文存本地——内网工具，README 已提示）
+ *   servers.json     服务器配置（凭据 AES-256-GCM 加密、密钥 .secret-key；TOFU 主机指纹 hostFingerprint）
  *   datasets/<id>.json  数据集文件（同时保存 dataset_info 片段）
  *   jobs/<id>.json   任务记录（状态/日志尾部缓存在内存，重启后从远端对账）
  *
@@ -65,6 +65,42 @@ ensureDirs();
  */
 function readJson(file, fallback) { return STORE.readJson(file, fallback); }
 function writeJson(file, obj) { STORE.writeJsonSync(file, obj); }
+
+// RLCD 脚本环境根目录（Windows 开发机默认 D:/llm-training；Linux 容器默认 /opt/rlcd-training，均可用 RLCD_ROOT 覆盖）
+const RLCD_ROOT = process.env.RLCD_ROOT || (process.platform === 'win32' ? 'D:/llm-training' : '/opt/rlcd-training');
+
+/**
+ * 凭据加密落盘：AES-256-GCM，机器密钥存 STORE_DIR/.secret-key（0600）。
+ * 历史缺陷：SSH 密码/私钥明文写 servers.json。密文以 enc:v1: 前缀标记，decSecret 兼容历史明文。
+ */
+const SECRET_KEY_FILE = path.join(STORE_DIR, '.secret-key');
+let _secretKey = null;
+function getSecretKey() {
+  if (_secretKey) return _secretKey;
+  try {
+    const hex = fs.readFileSync(SECRET_KEY_FILE, 'utf8').trim();
+    if (hex.length === 64) { _secretKey = Buffer.from(hex, 'hex'); return _secretKey; }
+  } catch (e) { /* 首次使用时生成 */ }
+  _secretKey = crypto.randomBytes(32);
+  fs.writeFileSync(SECRET_KEY_FILE, _secretKey.toString('hex'), { mode: 0o600 });
+  return _secretKey;
+}
+function encSecret(plain) {
+  const iv = crypto.randomBytes(12);
+  const c = crypto.createCipheriv('aes-256-gcm', getSecretKey(), iv);
+  const enc = Buffer.concat([c.update(String(plain), 'utf8'), c.final()]);
+  return 'enc:v1:' + iv.toString('base64') + ':' + c.getAuthTag().toString('base64') + ':' + enc.toString('base64');
+}
+function decSecret(v) {
+  if (typeof v !== 'string' || !v.startsWith('enc:v1:')) return v || undefined; // 历史明文兜底
+  try {
+    const parts = v.split(':');
+    const d = crypto.createDecipheriv('aes-256-gcm', getSecretKey(), Buffer.from(parts[2], 'base64'));
+    d.setAuthTag(Buffer.from(parts[3], 'base64'));
+    return Buffer.concat([d.update(Buffer.from(parts[4], 'base64')), d.final()]).toString('utf8');
+  } catch (e) { return undefined; }
+}
+const crypto = require('crypto');
 function newId(prefix) {
   return prefix + '-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
 }
@@ -93,6 +129,39 @@ function shq(s) {
 }
 
 /**
+ * 支持 ~ 展开的路径引用：远端命令里 workdir 写作 '~/xxx' 时，
+ * 单引号内 tilde 不展开（2026-11-12 实证：会落成 $HOME 下字面量 '~' 目录）。
+ * wq() 把 ~ 前缀翻译成 "$HOME/..."（双引号内 $HOME 由远端 shell 展开；
+ * 本地 Git Bash 同样有 $HOME），其余情况仍走 shq() 单引号转义。
+ * 要求路径不含双引号（validateServerFields 对 remoteWorkdir 已拒绝）。
+ */
+function wq(p) {
+  const s = String(p == null ? '' : p);
+  if (s === '~') return '"$HOME"';
+  if (s.indexOf('~/') === 0) return '"$HOME/' + s.slice(2) + '"';
+  return shq(s);
+}
+
+/**
+ * 解析 python 解释器路径。历史缺陷：评估/对话/kev 站点硬编码
+ * dirname(cliPath)+'/python.exe'（Windows 残留），Linux 远端不存在该文件，
+ * 设置 cliPath 后评估、对话、kev 全部失败。
+ * 优先级：server.pythonBin（用户显式配置）> cliPath 同目录 python
+ * （含路径分隔符时才推导）> 本地 'python' / 远端 'python3'。
+ */
+function resolvePyBin(server) {
+  const s = server || {};
+  if (typeof s.pythonBin === 'string' && s.pythonBin.trim()) return s.pythonBin.trim();
+  const cli = String(s.cliPath || '').trim();
+  if (cli && /[\\/]/.test(cli)) {
+    const dir = cli.replace(/[\\/]+$/, '').replace(/[\\/][^\\/]+$/, '');
+    if (/^[A-Za-z]:[\\/]/.test(cli)) return dir + '/python.exe'; // Windows 本地 venv
+    return dir + '/python';                                      // 远端 Linux / Git Bash
+  }
+  return isLocal(s) ? 'python' : 'python3';
+}
+
+/**
  * 杀整个训练进程树（含 python 孙进程）。
  * 平台启动链：node → bash(-c) → nohup bash → python；pid 文件记录的是 nohup 外壳 bash。
  * 旧实现只 kill $PID + pkill -P $PID（直接子进程），python 孙进程会漏杀——
@@ -102,12 +171,19 @@ function shq(s) {
  * python 不在其中，taskkill /T 按 Windows 进程树击杀是本地模式的权威手段。
  */
 function buildKillTreeCommand(jobId, workdir) {
-  return 'cd ' + shq(workdir) + ' && if [ -f run/' + jobId + '.pid ]; then PID=$(cat run/' + jobId + '.pid); ' +
-    'TREE=""; COLLECT() { for C in $(pgrep -P $1 2>/dev/null); do COLLECT $C; done; TREE="$TREE $1"; }; ' +
-    'COLLECT $PID; ' +
-    'for P in $TREE; do kill $P 2>/dev/null; done; sleep 2; ' +
-    'for P in $TREE; do kill -9 $P 2>/dev/null; done; echo killed-tree; ' +
-    'else echo nopid; fi';
+  // Windows SSH 服务器：Git Bash 的 pgrep 看不见 Windows 原生进程（训练是
+  // Start-Process cmd → python，全在原生进程表）。用 PowerShell 按命令行匹配
+  // jobId 击杀整个进程链（cmd /c → python），等价本地模式的 taskkill /T 思路。
+  // bash 兜底链在前：pid 文件若存在且有效（Git Bash 起的进程）先用 Unix kill。
+  const psKill = [
+    '$procs = Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match \'' + jobId + '\' }',
+    'foreach ($p in $procs) { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue }',
+    'Write-Output PS_KILLED',
+  ].join('; ');
+  const b64 = Buffer.from(psKill, 'utf16le').toString('base64');
+  return 'cd ' + wq(workdir) + ' && if [ -f run/' + jobId + '.pid ]; then PID=$(cat run/' + jobId + '.pid); ' +
+    'kill $PID 2>/dev/null; kill -9 $PID 2>/dev/null; fi; ' +
+    'powershell -NoProfile -EncodedCommand ' + b64 + ' 2>/dev/null; echo killed-tree';
 }
 
 /** 本地模式 Windows 原生进程树击杀（权威兜底）。
@@ -117,6 +193,7 @@ function buildKillTreeCommand(jobId, workdir) {
  *  用 CIM Win32_Process 枚举命令行含 jobId 的进程，从叶子往根逐个 taskkill /F。
  */
 function killTreeWindows(jobId) {
+  if (process.platform !== 'win32') return; // 仅 Windows 本地模式；Linux/macOS 走 bash kill 链路
   try {
     const out = cp.execSync(
       'powershell -NoProfile -Command "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like \'*' + jobId + '*\' } | Select-Object -ExpandProperty ProcessId"',
@@ -144,7 +221,7 @@ function killTreeWindows(jobId) {
  * logs/<id>.*、run/<id>.pid、evals/eval-<id>-*、jobs/<id>.*.yaml（本地/远端同构命令）。
  */
 function buildCleanupCommand(jobId, workdir) {
-  return 'cd ' + shq(workdir) + ' && ' +
+  return 'cd ' + wq(workdir) + ' && ' +
     'rm -rf saves/' + jobId + ' rlcd-data/' + jobId + ' evals/eval-' + jobId + '-* 2>/dev/null; ' +
     'rm -f logs/' + jobId + '.log logs/' + jobId + '.exit run/' + jobId + '.pid jobs/' + jobId + '.yaml jobs/' + jobId + '.resume.yaml jobs/' + jobId + '.chat.py jobs/' + jobId + '.export.yaml jobs/' + jobId + '-eval.yaml 2>/dev/null; ' +
     'ls data/ 2>/dev/null | grep "^ds-" | while read F; do case "$F" in ' + jobId + '-eval*) rm -f "data/$F";; esac; done; ' +
@@ -159,7 +236,9 @@ function buildCleanupCommand(jobId, workdir) {
 function validateServerFields(p) {
   const strFields = [
     ['host', p.host], ['username', p.username],
-    ['remoteWorkdir', p.remoteWorkdir], ['cliPath', p.cliPath], ['name', p.name],
+    ['remoteWorkdir', p.remoteWorkdir], ['cliPath', p.cliPath],
+    ['pythonBin', p.pythonBin], ['name', p.name],
+    ['rlcdRoot', p.rlcdRoot],
   ];
   for (const [label, v] of strFields) {
     if (v == null) continue;
@@ -168,8 +247,11 @@ function validateServerFields(p) {
     if (/[\r\n\x00-\x1f]/.test(s)) return label + ' 含非法控制字符';
     if (label === 'host' && !/^[A-Za-z0-9._-]+$/.test(s)) return 'host 仅允许字母、数字、点、下划线、连字符';
     if (label === 'username' && !/^[A-Za-z0-9._@-]+$/.test(s)) return 'username 仅允许字母、数字、点、下划线、连字符、@';
-    if (label === 'remoteWorkdir' && (s.startsWith('-') || /[;&|`$<>]/.test(s))) return 'remoteWorkdir 含 shell 元字符';
+    // remoteWorkdir 走 wq()（~/ 前缀进双引号），额外拒绝双引号与反斜杠防止破坏引用
+    if (label === 'remoteWorkdir' && (s.startsWith('-') || /[;&|`$<>"\\]/.test(s))) return 'remoteWorkdir 含 shell 元字符';
     if (label === 'cliPath' && /[;&|`$<>]/.test(s)) return 'cliPath 含 shell 元字符';
+    if (label === 'pythonBin' && /[;&|`$<>]/.test(s)) return 'pythonBin 含 shell 元字符';
+    if (label === 'rlcdRoot' && /[;&|`$<>]/.test(s)) return 'rlcdRoot 含 shell 元字符';
   }
   if (p.port != null && (!Number.isInteger(Number(p.port)) || Number(p.port) < 1 || Number(p.port) > 65535)) {
     return 'port 必须是 1-65535 的整数';
@@ -234,17 +316,6 @@ function findServer(id) {
  */
 function isLocal(server) { return !!(server && server.local); }
 
-/**
- * 训练环境路径（可配置，不写死开发机布局）：
- *   TRAINING_ROOT  训练环境根目录（train_rlcd.py / kev_rlcd_bridge.py / venv 所在地）
- *   TRAINING_WORKDIR  任务工作目录（data/jobs/logs/run/saves）
- *   TRAINING_CLI   llamafactory-cli 路径（默认取 TRAINING_ROOT/venv/...，Linux 自动换 bin）
- */
-const TRAINING_ROOT = process.env.TRAINING_ROOT || process.env.TRAINING_DIR || '.';
-const TRAINING_WORKDIR = process.env.TRAINING_WORKDIR || (TRAINING_ROOT + '/ai-harbor-training');
-const TRAINING_CLI = process.env.TRAINING_CLI ||
-  (process.platform === 'win32' ? TRAINING_ROOT + '/venv/Scripts/llamafactory-cli.exe' : TRAINING_ROOT + '/venv/bin/llamafactory-cli');
-
 /** Windows 路径 ↔ bash 路径（D:/x 或 D:\x → /d/x）。非盘符路径原样返回。 */
 function toBashPath(p) {
   const s = String(p || '');
@@ -254,6 +325,10 @@ function toBashPath(p) {
 }
 
 const BASH_EXE = (function () {
+  // Linux/macOS 容器环境：直接用系统 bash，跳过全部 Windows 探测路径
+  // （历史残留：D:\software\workbuddy 等 Windows 路径在容器启动日志里
+  // 连续报 not found 噪音，且探测本身浪费时间）。
+  if (process.platform !== 'win32') return 'bash';
   // 依次探测可用的 bash：Windows 内置 OpenSSH 自带的没有 bash，用 Git Bash。
   // 探测必须验证「能访问 Windows 盘符路径」——C:\Windows\System32\bash.exe 是 WSL
   // 的入口，能执行 echo 但它的 / 是 Linux 根目录，cd D:/xxx 会失败，导致训练
@@ -311,13 +386,34 @@ function localWriteFile(remotePath, content) {
   return new Promise(function (resolve, reject) {
     let p = String(remotePath || '');
     if (p.startsWith('~/') || p === '~') {
-      p = path.join(process.env.USERPROFILE || '', p.slice(2));
+      p = path.join(process.env.USERPROFILE || process.env.HOME || '', p.slice(2));
     }
     fs.mkdir(path.dirname(p), { recursive: true }, function (err) {
       if (err) return reject(err);
       fs.writeFile(p, content, function (e2) { e2 ? reject(e2) : resolve({ ok: true, path: p }); });
     });
   });
+}
+
+/**
+ * TOFU 主机指纹校验（防 SSH 中间人）：首次连接记录 sha256 指纹到服务器记录，
+ * 之后每次连接比对，不一致立即拒绝。服务器重装/换钥后编辑保存一次可重置。
+ */
+function hostVerifierFor(server) {
+  return function (hash, cb) {
+    const fp = String(hash || '').replace(/=+$/, '');
+    const stored = server.hostFingerprint;
+    if (!stored) {
+      try {
+        const list = listServers();
+        const rec = list.find(function (s) { return s.id === server.id; });
+        if (rec && !rec.hostFingerprint) { rec.hostFingerprint = fp; saveServers(list); }
+        server.hostFingerprint = fp;
+      } catch (e) { /* 指纹记录失败不阻断本次连接 */ }
+      return cb(true);
+    }
+    cb(stored === fp);
+  };
 }
 
 function sshExec(server, command, timeoutMs) {
@@ -336,24 +432,39 @@ function sshExec(server, command, timeoutMs) {
         if (err) { clearTimeout(timer); finish(reject, err); return; }
         let stdout = '';
         let stderr = '';
+        let streamClosed = false;   // stream 正常收尾后，连接层的 RST 一律忽略
         stream.on('data', function (d) { stdout += d.toString(); if (stdout.length > 2 * 1024 * 1024) stdout = stdout.slice(-1024 * 1024); });
         stream.stderr.on('data', function (d) { stderr += d.toString(); if (stderr.length > 1024 * 1024) stderr = stderr.slice(-512 * 1024); });
         stream.on('close', function (code) {
+          streamClosed = true;
           clearTimeout(timer);
           finish(resolve, { code: code === null ? 0 : code, stdout: stdout, stderr: stderr });
         });
+        // Windows sshd + Git Bash 组合：命令退出后连接常以 RST 而非 FIN 收尾，
+        // ssh2 在 conn 层抛 read ECONNRESET。命令已拿到完整输出/退出码时这是
+        // 无害噪声（2026-11-13 实测：mkdir/上传全部成功仍报 reset）。
+        stream.on('exit', function () { streamClosed = true; });
+        conn.once('close', function () { if (streamClosed) { clearTimeout(timer); try { conn.end(); } catch (e) {} } });
       });
     }).on('error', function (err) {
+      // stream 已收尾后的连接层错误（RST）不当作命令失败
+      if (settled) return;
       clearTimeout(timer);
+      if (/host key/i.test(String((err && err.message) || ''))) {
+        finish(reject, new Error('SSH 主机指纹校验失败（防中间人拦截）：远端密钥与首次连接记录不一致。若确认服务器已重装/换钥，编辑该服务器重新保存一次即可重置指纹。'));
+        return;
+      }
       finish(reject, err);
     }).connect({
       host: server.host,
       port: server.port || 22,
       username: server.username,
-      password: server.password || undefined,
-      privateKey: server.privateKey || undefined,
+      password: decSecret(server.password) || undefined,
+      privateKey: decSecret(server.privateKey) || undefined,
       readyTimeout: 15000,
       keepaliveInterval: 10000,
+      hostHash: 'sha256',
+      hostVerifier: hostVerifierFor(server),
     });
   });
 }
@@ -365,32 +476,67 @@ function sshWriteFile(server, remotePath, content) {
     let p = String(remotePath || '');
     if (p.startsWith('~')) {
       const rest = p.slice(1).replace(/^([\\/])/, '');
-      p = path.join(process.env.USERPROFILE || '', rest);
+      p = path.join(process.env.USERPROFILE || process.env.HOME || '', rest);
     }
     return localWriteFile(p, content);
   }
   return new Promise(function (resolve, reject) {
     const conn = new Client();
     let settled = false;
+    let stderr = '';
     const finish = (fn, arg) => { if (!settled) { settled = true; try { conn.end(); } catch (e) {} fn(arg); } };
+    // 安全网：写入流最迟 30s 内完成（Git Bash sshd 下 stream close 事件实测不触发，
+    // exit 事件触发——2026-11-13 提交训练挂死的根因）。超时则查证文件是否已落盘。
+    const timer = setTimeout(function () {
+      conn.exec('test -s ' + wq(remotePath) + ' && echo EXISTS', function (err, s2) {
+        if (err || !s2) { finish(reject, new Error('写入超时且无法查证: ' + String(remotePath))); return; }
+        let o = '';
+        s2.on('data', c => o += c);
+        s2.on('close', () => {
+          if (/EXISTS/.test(o)) finish(resolve, { ok: true });
+          else finish(reject, new Error('写入超时且远端文件为空: ' + String(remotePath)));
+        });
+        s2.on('exit', () => { if (!/EXISTS/.test(o)) { setTimeout(() => { if (/EXISTS/.test(o)) finish(resolve, { ok: true }); }, 500); } });
+      });
+    }, 30000);
     conn.on('ready', function () {
-      conn.exec('cat > ' + JSON.stringify(remotePath), function (err, stream) {
-        if (err) { finish(reject, err); return; }
-        let stderr = '';
+      conn.exec('cat > ' + wq(remotePath), function (err, stream) {
+        if (err) { clearTimeout(timer); finish(reject, err); return; }
         stream.stderr.on('data', function (d) { stderr += d.toString(); });
-        stream.on('close', function (code) {
-          finish(code === 0 ? resolve : reject, code === 0 ? { ok: true } : new Error('写入失败: ' + stderr));
+        // Windows Git Bash sshd：exit 可靠触发、close 可能永远不触发（实测）。
+        // 两者谁先到都按同一退出码语义结算；都不到则由 30s 安全网查证。
+        let code = null;
+        const settle = function () {
+          clearTimeout(timer);
+          finish(code == null || code === 0 ? resolve : reject,
+            code == null || code === 0 ? { ok: true } : new Error('写入失败: ' + stderr));
+        };
+        stream.on('close', function (c) { code = c; settle(); });
+        stream.on('exit', function (c) {
+          code = c;
+          // exit 到达后 close 一般紧随；给 400ms 缓冲让 close 补充 stderr 尾部数据
+          setTimeout(settle, 400);
         });
         stream.end(content);
       });
-    }).on('error', function (err) { finish(reject, err); })
+    }).on('error', function (err) {
+      if (settled) return;
+      clearTimeout(timer);
+      if (/host key/i.test(String((err && err.message) || ''))) {
+        finish(reject, new Error('SSH 主机指纹校验失败（防中间人拦截）：远端密钥与首次连接记录不一致。若确认服务器已重装/换钥，编辑该服务器重新保存一次即可重置指纹。'));
+        return;
+      }
+      finish(reject, err);
+    })
       .connect({
         host: server.host,
         port: server.port || 22,
         username: server.username,
-        password: server.password || undefined,
-        privateKey: server.privateKey || undefined,
+        password: decSecret(server.password) || undefined,
+        privateKey: decSecret(server.privateKey) || undefined,
         readyTimeout: 15000,
+        hostHash: 'sha256',
+        hostVerifier: hostVerifierFor(server),
       });
   });
 }
@@ -454,8 +600,10 @@ function buildYaml(cfg) {
   pushIf('preprocessing_num_workers', cfg.preprocessingNumWorkers || 8);
   // Windows + spawn 模式下 DataLoader 多进程 worker 与 transformers 的
   // enable_input_require_grads 闭包不兼容（pickle 失败导致训练崩溃），
-  // 本地模式（Windows）一律 0；Linux 远端保留 2 提速
-  if (cfg.isLocal) push('dataloader_num_workers', 0);
+  // Windows 本地与 Windows SSH 远端一律 0（2026-11-13 实测：A1000 笔记本
+  // SSH 远端 dataloader_num_workers:2 直接 AttributeError 崩溃）；
+  // Linux 远端保留 2 提速
+  if (cfg.isLocal || cfg.serverIsWindows) push('dataloader_num_workers', 0);
   else pushIf('dataloader_num_workers', cfg.dataloaderNumWorkers || 2);
   pushIf('val_size', cfg.valSize, cfg.valSize !== undefined && cfg.valSize !== '' && Number(cfg.valSize) > 0);
 
@@ -490,6 +638,32 @@ function buildYaml(cfg) {
   }
 
   return lines.join('\n') + '\n';
+}
+
+/**
+ * Windows SSH 服务器通用启动器（kev / RLCD / LF 三分支共用）。
+ * 先上传 run-job.ps1（幂等，内容固定），再执行：
+ *   Start-Process cmd.exe '/c <innerCmd> > log 2>&1' -WindowStyle Hidden
+ * 进程完全独立于 SSH 会话（实测断连后持续运行），innerCmd 由调用方给出
+ * bash 兼容形态（Git Bash 是默认 shell，POSIX 路径可用）。
+ * 返回可直接交给 sshExec 的命令字符串。
+ */
+async function windowsDetachedStart(server, workdir, jobId, innerCmd) {
+  const wdWin = String(workdir).replace(/\//g, '\\');
+  // PowerShell 字符串字面量：innerCmd 已是 POSIX 形态（Git Bash 默认 shell 执行），
+  // 用单引号包裹并把内部单引号翻倍——innerCmd 内部全部经 shq 转义过，不含裸单引号
+  const psInner = String(innerCmd).replace(/'/g, "''");
+  const psLauncher = [
+    'param($jobId)',
+    '$wd = \'' + wdWin + '\'',
+    '$inner = \'' + psInner + '\'',
+    '$argline = "/c cd /d " + $wd + " && " + $inner + " > logs\\" + $jobId + ".log 2>&1"',
+    'Start-Process -FilePath "cmd.exe" -ArgumentList $argline -WindowStyle Hidden',
+    'Write-Output ("LAUNCHED " + $jobId)',
+  ].join('\r\n') + '\r\n';
+  await sshWriteFile(server, workdir + '/run-job.ps1', psLauncher);
+  return 'powershell -NoProfile -ExecutionPolicy Bypass -File ' +
+    shq(wdWin + '\\run-job.ps1') + ' -jobId ' + shq(jobId);
 }
 
 // ── 任务管理 ────────────────────────────────────────────────────────────
@@ -527,7 +701,7 @@ async function refreshJobStatus(job, server) {
   try {
     // 1) 进程是否还活着（我们启动时写 pid 文件）
     const pidRes = await sshExec(server,
-      `cd ${shq(workdir)} && if [ -f run/${job.id}.pid ]; then PID=$(cat run/${job.id}.pid); if kill -0 $PID 2>/dev/null; then echo RUNNING $PID; else echo DEAD $PID; fi; else echo NORECORD; fi; echo "EXITCODE=$(cat logs/${job.id}.exit 2>/dev/null || echo NONE)"`,
+      `cd ${wq(workdir)} && if [ -f run/${job.id}.pid ]; then PID=$(cat run/${job.id}.pid); if kill -0 $PID 2>/dev/null; then echo RUNNING $PID; else echo DEAD $PID; fi; else echo NORECORD; fi; echo "EXITCODE=$(cat logs/${job.id}.exit 2>/dev/null || echo NONE)"`,
       20000);
     // 启动命令会把真实退出码写进 logs/<id>.exit；此前从未读取，完成判定只看日志文本，
     // 失败训练若日志里出现 "Saving checkpoint" 就会被误判为 completed。
@@ -543,7 +717,7 @@ async function refreshJobStatus(job, server) {
         `cat saves/${job.id}/metrics.jsonl 2>/dev/null | tail -300; echo RLCD_METRICS_END; `
       : '';
     const logRes = await sshExec(server,
-      `cd ${shq(workdir)} && LOG=logs/${job.id}.log; if [ -f $LOG ]; then wc -l < $LOG; tail -c 8000 $LOG; else echo 0; echo "(no log yet)"; fi; ` +
+      `cd ${wq(workdir)} && LOG=logs/${job.id}.log; if [ -f $LOG ]; then wc -l < $LOG; tail -c 8000 $LOG; else echo 0; echo "(no log yet)"; fi; ` +
       rlcdProbe +
       `ls -1 saves/${job.id}/adapter_model.sfin 2>/dev/null; ls -1 saves/${job.id}/adapter_model.safetensors 2>/dev/null; ls -1 saves/${job.id}/head.pt 2>/dev/null; ls -d saves/${job.id}/checkpoint-* 2>/dev/null | tail -3; ls -d saves/${job.id}/snapshots/step-* 2>/dev/null | tail -3`,
       20000);
@@ -700,6 +874,10 @@ async function refreshJobStatus(job, server) {
       checkpoints: checkpoints,
       hasFinalAdapter: hasFinalAdapter,
       lastCheckedAt: Date.now(),
+      // SSH 对账成功 → 清除历史 unreachable 标记（服务器恢复可达后自愈；
+      // 历史缺陷：只在 catch 里置 true，成功分支不重置，任务永远带 stale 标记，
+      // 且低频对账（每10分钟）会因此跳过它们）
+      unreachable: false,
     });
     console.log('[refresh-debug]', job.id, '| final status=', status, '| hasFinalAdapter=', hasFinalAdapter, '| unreachable-was=', !!job.unreachable);
     saveJob(updated);
@@ -989,14 +1167,14 @@ function validateDecisionSamples(samples) {
  */
 function buildRlcdTrainCommand(server, jobId, cfg, ds) {
   const workdir = server.remoteWorkdir || '~/ai-harbor-training';
-  const pyBin = server.cliPath
-    ? require('path').dirname(server.cliPath).replace(/\\/g, '/') + '/python.exe'
-    : 'python3';
-  // RLCD 脚本在 TRAINING_ROOT（训练 venv 同目录，环境变量可配）；数据/产物用 workdir 相对路径
+  const pyBin = resolvePyBin(server);
+  // RLCD 脚本根目录：本地模式用进程 RLCD_ROOT；SSH 远端用 server.rlcdRoot
+  // （脚本环境长在目标机器上——如笔记本 D:/llm-training，容器自己的 RLCD_ROOT 与远端无关）
+  const rlcdRoot = isLocal(server) ? RLCD_ROOT : (server.rlcdRoot || RLCD_ROOT);
   // 基座模型：HuggingFace 名会在离线环境失败，本地路径直接可用（冒烟已验证）
-  const baseModel = cfg.modelName || (TRAINING_ROOT + '/models/Qwen3-0.6B');
+  const baseModel = cfg.modelName || (rlcdRoot + '/models/Qwen3-0.6B');
   const args = [
-    TRAINING_ROOT + '/train_rlcd.py',
+    rlcdRoot + '/train_rlcd.py',
     '--data-dir', 'rlcd-data/' + jobId,
     '--base', baseModel,
     '--steps', String(cfg.rlcdSteps || 100),
@@ -1023,9 +1201,7 @@ function buildRlcdTrainCommand(server, jobId, cfg, ds) {
 /** kev 训练命令构建（类 Jev 决策模型训练，Windows 本地经 venv python） */
 function buildKevTrainCommand(server, jobId, cfg, ds) {
   const workdir = server.remoteWorkdir || '~/ai-harbor-training';
-  const pyBin = server.cliPath
-    ? require('path').dirname(server.cliPath).replace(/\\/g, '/') + '/python.exe'
-    : 'python3';
+  const pyBin = resolvePyBin(server);
   const args = [
     '-m', 'kev.train',
     '--data', 'data/' + ds.fileName,       // 训练数据（decision JSONL，已上传）
@@ -1090,9 +1266,7 @@ function createEvalIo(server, job, opts) {
   const bwd = toBashPath(workdir).replace(/\/$/, '');
   const wd = workdir.replace(/\/$/, '');
   const local = isLocal(server);
-  const pyBin = server.cliPath
-    ? path.dirname(server.cliPath).replace(/\\/g, '/') + '/python.exe'
-    : (local ? 'python' : 'python3');
+  const pyBin = resolvePyBin(server);
   const cliBin = server.cliPath || 'llamafactory-cli';
   const winPath = function (rel) { return wd + '/' + rel; };
   const bashPath = function (rel) { return bwd + '/' + rel; };
@@ -1125,20 +1299,20 @@ function createEvalIo(server, job, opts) {
         // rlcd 任务的 checkpoint 是 rlcd-lite adapter（不是 kev head.pt），
         // 走 train_rlcd.py eval 子命令；kev 任务走原生 kev.benchmark。
         const cmd = job.trainMode === 'rlcd'
-          ? 'cd ' + shq(bashPath('')) + ' && ' + shq(pyBin) + ' ' + shq(TRAINING_ROOT + '/train_rlcd.py') + ' eval' +
+          ? 'cd ' + wq(bashPath('')) + ' && ' + shq(pyBin) + ' ' + shq(RLCD_ROOT + '/train_rlcd.py') + ' eval' +
             ' --run ' + shq('saves/' + job.id) +
             ' --eval-data ' + shq(evalFile) +
             ' --out ' + shq(outDir) + ' --device cuda --dtype bf16'
-          : 'cd ' + shq(bashPath('')) + ' && ' + shq(pyBin) + ' -m kev.benchmark' +
+          : 'cd ' + wq(bashPath('')) + ' && ' + shq(pyBin) + ' -m kev.benchmark' +
             ' --run ' + shq('saves/' + job.id) +
             ' --data ' + shq(evalFile) +
             ' --out ' + shq(outDir) + ' --device cuda';
         const timeout = Math.min(30 * 60 * 1000, Math.max(5 * 60 * 1000, plan.samples.length * 4000));
         await evalSh(server, cmd, timeout);
-        const rowsText = await evalSh(server, 'cat ' + shq(bashPath(outDir + '/rows.json')), 60000);
-        const reportText = await evalSh(server, 'cat ' + shq(bashPath(outDir + '/report.json')), 60000);
+        const rowsText = await evalSh(server, 'cat ' + wq(bashPath(outDir + '/rows.json')), 60000);
+        const reportText = await evalSh(server, 'cat ' + wq(bashPath(outDir + '/report.json')), 60000);
         // 评估临时数据文件用完即删（rows/report 已读出；evals/<tag> 目录保留供追溯）
-        try { await evalSh(server, 'rm -f ' + shq(bashPath(evalFile)), 15000); } catch (e) {}
+        try { await evalSh(server, 'rm -f ' + wq(bashPath(evalFile)), 15000); } catch (e) {}
         return { engine: 'kev', rowsText: rowsText, reportText: reportText, taskType: 'classification',
           rlcdFormat: job.trainMode === 'rlcd',
           artifacts: { evalFile: evalFile, outDir: outDir, command: cmd } };
@@ -1157,7 +1331,7 @@ function createEvalIo(server, job, opts) {
         // 本机 Git Bash 里 `python3` 可能落到 Microsoft Store 的 python 别名（退出码 49），
         // 必须显式用训练环境的 venv Python；远端 Linux 同样可用这个解释器。
         const merge =
-          'cd ' + shq(bashPath('data')) + ' && ' + shq(pyBin) + ' - <<\'PYEOF\'\n' +
+          'cd ' + wq(bashPath('data')) + ' && ' + shq(pyBin) + ' - <<\'PYEOF\'\n' +
           'import json, os\n' +
           'info = {}\n' +
           'if os.path.exists("dataset_info.json"):\n' +
@@ -1183,7 +1357,10 @@ function createEvalIo(server, job, opts) {
           'max_samples: ' + plan.maxSamples,
           'overwrite_cache: true',
           'preprocessing_num_workers: 8',
-          'dataloader_num_workers: ' + (local ? 0 : 8),
+          // Windows（本地或 SSH 远端）一律 0：DataLoader 多进程与 transformers 的
+          // enable_input_require_grads 闭包 pickle 不兼容（训练侧同款崩溃——2026-11-13
+          // 评估实测 eval yaml workers:8 起不来）
+          'dataloader_num_workers: ' + ((local || job.serverIsWindows || server.windowsShell) ? 0 : 8),
           '', '### output',
           'output_dir: evals/' + evalTag,
           'overwrite_output_dir: true',
@@ -1194,22 +1371,46 @@ function createEvalIo(server, job, opts) {
         ].join('\n');
         const yamlFile = 'jobs/' + job.id + '-eval.yaml';
         await sshWriteFile(server, winPath(yamlFile), predictYaml);
-        const cmd = 'cd ' + shq(bashPath('')) + ' && ' + shq(cliBin) + ' train ' + yamlFile;
-        await evalSh(server, cmd, Math.min(30 * 60 * 1000, Math.max(5 * 60 * 1000, plan.maxSamples * 8000)));
+        // Windows SSH 远端：脱离会话跑评估（同步 SSH 等待在长推理下会超时判失败，
+        // 而进程实际还在跑——2026-11-13 实测）。轮询产物文件出现即继续。
+        if (server.windowsShell) {
+          // inner 形态对齐 LF 训练分支：bash -c '内层 shq(cliBin) 拼命令'（外层只包一次）
+          const innerEval = 'bash -c ' + shq(shq(cliBin) + ' train ' + yamlFile +
+            '; echo $? > logs/' + job.id + '-eval.exit');
+          const launchCmd = await windowsDetachedStart(server, workdir, 'eval-' + evalTag, innerEval);
+          const predRel = 'evals/' + evalTag + '/generated_predictions.jsonl';
+          const predAbs = bashPath(predRel);
+          // Windows 推理等待：模型加载 2-3 分钟起步（A1000 实测），SSH 中转下每次
+          // probe 也要 7s+。上限 = max(20 分钟, 样本数×20s)，封顶 40 分钟。
+          const waitMs = Math.min(40 * 60 * 1000, Math.max(20 * 60 * 1000, plan.maxSamples * 20000));
+          const waitDeadline = Date.now() + waitMs;
+          let predReady = false;
+          while (Date.now() < waitDeadline) {
+            await new Promise(r => setTimeout(r, 15000));
+            try {
+              const probe = await sshExec(server, 'test -s ' + wq(predAbs) + ' && echo PRED_OK', 20000);
+              if (/PRED_OK/.test(probe.stdout || '')) { predReady = true; break; }
+            } catch (e) { /* 网络抖动重试 */ }
+          }
+          if (!predReady) throw new Error('评估超时：' + Math.round(waitMs / 60000) + ' 分钟内未见 ' + predRel + '（推理可能仍在进行，请稍后手动重试评估）');
+        } else {
+          const cmd = 'cd ' + wq(bashPath('')) + ' && ' + shq(cliBin) + ' train ' + yamlFile;
+          await evalSh(server, cmd, Math.min(30 * 60 * 1000, Math.max(5 * 60 * 1000, plan.maxSamples * 8000)));
+        }
         const predFile = 'evals/' + evalTag + '/generated_predictions.jsonl';
-        const predictionsText = await evalSh(server, 'cat ' + shq(bashPath(predFile)) + ' 2>/dev/null || true', 60000);
+        const predictionsText = await evalSh(server, 'cat ' + wq(bashPath(predFile)) + ' 2>/dev/null || true', 60000);
         if (!predictionsText.trim()) throw new Error('未找到 generated_predictions.jsonl：' + predFile + '（请确认 LLaMA-Factory 版本与评估集格式）');
         // 评估临时件清理（2026-11-11）：-eval 数据文件 + dataset_info 条目 + 评估 yaml 用完即删——
         // 此前不清理，每次评估都在训练数据目录累积污染（实测 3 个 -eval 文件 + dataset_info 残留）
         try {
-          const rmEval = 'cd ' + shq(bashPath('')) + ' && rm -f ' + shq(evalFile) + ' ' + shq(yamlFile) + ' && ' +
+          const rmEval = 'cd ' + wq(bashPath('')) + ' && rm -f ' + shq(evalFile) + ' ' + shq(yamlFile) + ' && ' +
             shq(pyBin) + ' - <<\'PYEOF\'\n' +
             'import json, os\n' +
-            'try://n' +
+            'try:\n' +
             '    info = json.load(open("data/dataset_info.json"))\n' +
             '    info.pop(' + JSON.stringify(evalName) + ', None)\n' +
             '    json.dump(info, open("data/dataset_info.json", "w"), ensure_ascii=False, indent=2)\n' +
-            'except Exception://n' +
+            'except Exception:\n' +
             '    pass\n' +
             'PYEOF';
           await evalSh(server, rmEval, 30000);
@@ -1287,8 +1488,8 @@ async function handleModelTrainingRequest(req, res) {
           id: newId('srv'),
           local: true,
           name: p.name || '本机（localhost）',
-          remoteWorkdir: p.remoteWorkdir || TRAINING_WORKDIR,
-          cliPath: p.cliPath || TRAINING_CLI,
+          remoteWorkdir: p.remoteWorkdir || '~/ai-harbor-training',
+          cliPath: p.cliPath || '',
         }, p, { createdAt: Date.now() });
         list.push(server);
       }
@@ -1301,6 +1502,9 @@ async function handleModelTrainingRequest(req, res) {
       // 编辑时允许沿用已保存的密码或私钥（前端出于安全不回填凭据本体）
       if (!old || (!old.password && !old.privateKey)) return sendJson(res, 400, { ok: false, error: 'password 或 privateKey 必填' });
     }
+    // 凭据加密后合并（明文只存在于请求内存，不落盘；enc:v1: 前缀标记密文）
+    if (p.password) p.password = encSecret(p.password);
+    if (p.privateKey) p.privateKey = encSecret(p.privateKey);
     const list = listServers();
     let server;
     if (p.id) {
@@ -1320,36 +1524,89 @@ async function handleModelTrainingRequest(req, res) {
   }
   if (pathname === '/api/model-training/servers/delete' && req.method === 'POST') {
     const body = await parseRequestBody(req);
-    const list = listServers().filter(s => s.id !== (body.data || {}).id);
+    const delId = (body.data || {}).id;
+    // id 过白名单（与其他端点同一标准；历史缺陷：无校验，任意字符串直接进 filter）
+    if (!isSafeId(delId)) return badId(res);
+    const list = listServers().filter(s => s.id !== delId);
     saveServers(list);
     return sendJson(res, 200, { ok: true });
   }
   if (pathname === '/api/model-training/servers/test' && req.method === 'POST') {
     const body = await parseRequestBody(req);
+    if (body.error) return sendJson(res, 400, { ok: false, error: body.error });
     const p = body.data || {};
     let server = p.id ? findServer(p.id) : null;
     if (!server) server = p;
     else server = Object.assign({}, server, p.password ? p : { password: server.password });
+    // adhoc / 覆盖字段与保存通道同标准校验（历史缺陷：cliPath 未校验直接拼进
+    // 双引号命令，匿名可触发任意命令执行——RCE）
+    const fieldErr = validateServerFields(server);
+    if (fieldErr) return sendJson(res, 400, { ok: false, error: fieldErr });
     try {
-      // 一次性探测：SSH 通、python/llamafactory、GPU、磁盘（本地模式同样命令——本地经 bash 执行，语法兼容）
+      // 一次性探测：SSH 通、python/pybin/llamafactory、GPU、磁盘
+      // Windows SSH（默认 shell 是 cmd）不支持 `;` 分隔与 Unix 重定向，多层引号转义
+      // 在 bash→ssh→cmd→powershell 传递中会被拆坏（实测 ParserError）。
+      // 修复：Windows 远端探测用 PowerShell EncodedCommand（脚本 base64/UTF-16LE），
+      // 零引号穿透，输出用与 Unix 探测一致的 == 分段标记。
       const cliBin = server.cliPath || 'llamafactory-cli';
-      const probe = await sshExec(server,
-        'echo "== os =="; uname -a 2>/dev/null || ver; ' +
-        'echo "== gpu =="; nvidia-smi --query-gpu=name,memory.total,memory.used --format=csv,noheader 2>/dev/null || echo "no nvidia-smi"; ' +
-        'echo "== python =="; which python3 2>/dev/null && python3 --version 2>&1; ' +
-        'echo "== llamafactory =="; ("' + cliBin + '" --help 2>/dev/null | head -1) || echo "NOT_INSTALLED"; ' +
-        (isLocal(server)
-          ? 'echo "== disk =="; df -h /d 2>/dev/null | tail -1'
-          : 'echo "== disk =="; df -h ~ | tail -1'),
-        45000);
-      const out = probe.stdout || '';
+      const pyBin = resolvePyBin(server);
+      const windowsRemote = !!server.windowsShell;
+      let probe;
+      if (windowsRemote) {
+        const psPy = String(pyBin).replace(/\\/g, '/');
+        const psCli = String(cliBin).replace(/\\/g, '/');
+        const psScript = [
+          'Write-Output "== os =="',
+          '(Get-CimInstance Win32_OperatingSystem).Caption',
+          'Write-Output "== gpu =="',
+          'nvidia-smi --query-gpu=name,memory.total,memory.used --format=csv,noheader',
+          'Write-Output "== python =="',
+          '"see-pybin"',
+          'Write-Output "== pybin =="',
+          '& "' + psPy + '" --version',
+          'Write-Output "== llamafactory =="',
+          '(& "' + psCli + '" --help | Select-Object -First 1)',
+          'Write-Output "== disk =="',
+          '"{0:N1} GB free on C:" -f ((Get-PSDrive C).Free/1GB)',
+        ].join('; ');
+        const b64 = Buffer.from(psScript, 'utf16le').toString('base64');
+        probe = await sshExec(server, 'powershell -NoProfile -EncodedCommand ' + b64, 60000);
+      } else {
+        probe = await sshExec(server,
+          'echo "== os =="; uname -a 2>/dev/null || ver; ' +
+          'echo "== gpu =="; nvidia-smi --query-gpu=name,memory.total,memory.used --format=csv,noheader 2>/dev/null || echo "no nvidia-smi"; ' +
+          'echo "== python =="; which python3 2>/dev/null && python3 --version 2>&1; ' +
+          'echo "== pybin =="; ' + shq(pyBin) + ' --version 2>&1 || echo "PYBIN_NOT_FOUND"; ' +
+          'echo "== llamafactory =="; (' + shq(cliBin) + ' --help 2>/dev/null | head -1) || echo "NOT_INSTALLED"; ' +
+          (isLocal(server)
+            ? 'echo "== disk =="; df -h /d 2>/dev/null | tail -1'
+            : 'echo "== disk =="; df -h ~ | tail -1'),
+          45000);
+      }
+      const out = (probe.stdout || '').replace(/\r\n/g, '\n');  // Windows CRLF 归一
+      const pybinLine = (out.split('== pybin ==\n')[1] || '').split('\n')[0] || '';
+      const python3Line = (out.split('== python ==\n')[1] || '').split('\n')[0] || '';
       const result = {
         ok: true,
         reachable: true,
         os: (out.match(/== os ==\n(.*)/) || [])[1] || '',
-        gpus: (out.split('== gpu ==\n')[1] || '').split('\n')[0] ? out.split('== gpu ==\n')[1].split('\n').filter(l => l && !l.startsWith('==')).map(l => l.trim()) : [],
-        python: (out.split('== python ==\n')[1] || '').split('\n')[0] || '',
-        llamafactoryInstalled: !/NOT_INSTALLED/.test(out),
+        // GPU 段截止到下一个 == 标记（Windows 探测无 NOT_INSTALLED 兜底，llamafactory 输出
+        // "Unknown command" 也算装了——exe 存在才会报这个；段边界用 /\n== / 防止吞并后段）
+        gpus: (function () {
+          const gpuSection = out.split('== gpu ==\n')[1] || '';
+          const gpuLines = gpuSection.split('\n== ')[0].split('\n')
+            .filter(l => l && !l.startsWith('==')).map(l => l.trim());
+          return gpuLines.length ? gpuLines : [];
+        })(),
+        python: python3Line,
+        pyBin,
+        pybinLine,
+        // pybin 探测失败但系统 python3 可用时，建议显式配置 pythonBin=python3
+        pythonBinSuggestion:
+          /PYBIN_NOT_FOUND/.test(pybinLine) && python3Line && !/NOT_FOUND/.test(python3Line)
+            ? 'python3'
+            : (pybinLine && !/PYBIN_NOT_FOUND/.test(pybinLine) ? pyBin : ''),
+        llamafactoryInstalled: !/NOT_INSTALLED/.test(out) || /Unknown command/.test(out),
         llamafactoryLine: (out.split('== llamafactory ==\n')[1] || '').split('\n')[0] || '',
         disk: (out.split('== disk ==\n')[1] || '').split('\n')[0] || '',
         raw: out.slice(0, 2000),
@@ -1374,14 +1631,16 @@ async function handleModelTrainingRequest(req, res) {
     const workdir = server.remoteWorkdir || '~/ai-harbor-training';
     try {
       // 列出 saves/ 全部目录
-      const ls = await sshExec(server, 'cd ' + shq(workdir) + ' && ls -1 saves/ 2>/dev/null', 30000);
+      const ls = await sshExec(server, 'cd ' + wq(workdir) + ' && ls -1 saves/ 2>/dev/null', 30000);
       const dirs = (ls.stdout || '').split('\n').map(s => s.trim()).filter(Boolean);
       const orphans = dirs.filter(d => {
         const m = d.match(/^(job-[a-z0-9]+)$/);
         return m && !fs.existsSync(path.join(JOBS_DIR, m[1] + '.json'));
       });
-      // 非平台 ID 的目录（smoke-test-1 等）也算孤儿
-      const foreign = dirs.filter(d => !/^job-[a-z0-9]+$/.test(d));
+      // 非平台 ID 的目录（smoke-test-1 等）也算孤儿。目录名只放行安全字符——
+      // 名字会拼进 rm -rf（历史缺陷：远端异常目录名未转义，可注入 shell 元字符）
+      const SAFE_DIR = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+      const foreign = dirs.filter(d => !/^job-[a-z0-9]+$/.test(d) && SAFE_DIR.test(d));
       const all = orphans.concat(foreign);
       if (!all.length) return sendJson(res, 200, { ok: true, cleaned: [], freedMB: 0, message: '没有孤儿产物' });
       // 逐个清理（不一次性 rm -rf 大串，失败隔离）
@@ -1389,9 +1648,12 @@ async function handleModelTrainingRequest(req, res) {
       let freed = 0;
       for (const d of all) {
         try {
-          const du = await sshExec(server, 'cd ' + shq(workdir) + ' && du -sm saves/' + d + ' 2>/dev/null | cut -f1', 15000);
+          const du = await sshExec(server, 'cd ' + wq(workdir) + ' && du -sm ' + shq('saves/' + d) + ' 2>/dev/null | cut -f1', 15000);
           const mb = parseInt((du.stdout || '0').trim(), 10) || 0;
-          await sshExec(server, 'cd ' + shq(workdir) + ' && rm -rf saves/' + d + ' rlcd-data/' + d + ' evals/eval-' + d + '-* logs/' + d + '.log logs/' + d + '.exit run/' + d + '.pid jobs/' + d + '.yaml 2>/dev/null; echo ok', 60000);
+          // 目录名已过 SAFE_DIR 白名单；普通路径 shq 转义，glob 段保持裸露以保留通配
+          const targets = [shq('saves/' + d), shq('rlcd-data/' + d), 'evals/eval-' + d + '-*',
+            shq('logs/' + d + '.log'), shq('logs/' + d + '.exit'), shq('run/' + d + '.pid'), shq('jobs/' + d + '.yaml')].join(' ');
+          await sshExec(server, 'cd ' + wq(workdir) + ' && rm -rf ' + targets + ' 2>/dev/null; echo ok', 60000);
           results.push({ dir: d, freedMB: mb });
           freed += mb;
         } catch (e) { results.push({ dir: d, error: String(e.message).slice(0, 80) }); }
@@ -1407,6 +1669,12 @@ async function handleModelTrainingRequest(req, res) {
     if (body.error) return sendJson(res, 400, { ok: false, error: body.error });
     const p = body.data || {};
     if (!p.name || !Array.isArray(p.samples)) return sendJson(res, 400, { ok: false, error: 'name 与 samples[] 必填' });
+    // 名称校验：空格自动归一为下划线（与训练侧 dataset 名处理一致），拒绝引号/$/控制
+    // 字符——该名字最终会进 dataset_info.json key 与远端 shell 命令（历史缺陷：无校验）
+    const safeName = String(p.name).trim().replace(/\s+/g, '_');
+    if (!safeName || safeName.length > 64 || !/^[\p{L}\p{N}._-]+$/u.test(safeName)) {
+      return sendJson(res, 400, { ok: false, error: '数据集名称仅允许中英文、数字、点、下划线、连字符（长度 1-64）' });
+    }
     // decision 类型校验（kev 类型化决策格式：state + questions[choice/score/noul] + label）
     if (p.kind === 'decision') {
       const err = validateDecisionSamples(p.samples);
@@ -1414,7 +1682,7 @@ async function handleModelTrainingRequest(req, res) {
     }
     const ds = {
       id: newId('ds'),
-      name: p.name,
+      name: safeName,
       kind: p.kind || 'sft',              // sft | preference | pretrain | decision（类 Jev 决策模型）
       formatting: p.formatting || 'alpaca', // alpaca | sharegpt（decision 类型不用此字段）
       samples: p.samples,
@@ -1575,6 +1843,13 @@ async function handleModelTrainingRequest(req, res) {
     const ds = listDatasets().find(d => d.id === p.datasetId);
     if (!ds) return sendJson(res, 400, { ok: false, error: '请先选择数据集' });
 
+    // GPU 并发锁：同一服务器已有 running 任务时拒绝新训练（训练+评估同卡并发会
+    // 打爆显存/互踩 output_dir；历史缺陷：无任何并发约束）
+    const busyJob = listJobs().find(j => j.serverId === server.id && j.status === 'running');
+    if (busyJob) {
+      return sendJson(res, 409, { ok: false, error: '服务器「' + (server.name || server.id) + '」上任务 ' + busyJob.id + ' 正在运行，同一服务器不允许并发训练；请等待完成或先停止' });
+    }
+
     // ── 后端硬校验（codex 审核 P0：错误配置必须在远端副作用开始前失败）──
     const isRlcd = p.trainMethod === 'rlcd';
     const isDecision = ds.kind === 'decision';
@@ -1636,6 +1911,7 @@ async function handleModelTrainingRequest(req, res) {
       dataset: ds.name.replace(/\s+/g, '_'),
       outputDir: 'saves/' + jobId,
       isLocal: isLocal(server),   // Windows 本地训练时 dataloader_num_workers 强制 0
+      serverIsWindows: !!server.windowsShell,  // Windows SSH 远端同样强制 0（pickle 崩溃）
       // codex 审核 P1：复现元数据固化——seed/解析后超参/环境/服务器标识
       seed: p.seed != null ? Number(p.seed) : 42,
       resolvedAt: Date.now(),
@@ -1653,7 +1929,7 @@ async function handleModelTrainingRequest(req, res) {
 
     try {
       // 1) 初始化远端目录结构
-      await sshExec(server, `mkdir -p ${shq(workdir)}/data ${shq(workdir)}/jobs ${shq(workdir)}/logs ${shq(workdir)}/run ${shq(workdir)}/saves`, 20000);
+      await sshExec(server, `mkdir -p ${wq(workdir)}/data ${wq(workdir)}/jobs ${wq(workdir)}/logs ${wq(workdir)}/run ${wq(workdir)}/saves`, 20000);
       // 2) 上传数据集文件：按原始文本透传，不再 readJson 解析后重新序列化。
       // 历史缺陷：decision 数据集是 .jsonl，readJson 会解析失败触发损坏文件隔离，
       // 且续训重传分支会把 samples=[] 写成空数据集；JSONL 必须整份透传。
@@ -1662,10 +1938,12 @@ async function handleModelTrainingRequest(req, res) {
       // ═══ RLCD 分支（decision 数据 + trainMethod=rlcd → GRPO + RLCR 奖励，基线 rlcd-lite）═══
       // 与 kev（纯监督 CE）的区别：RL 阶段训练决策准确率 + 概率校准（stated confidence）。
       if (ds.kind === 'decision' && cfg.trainMethod === 'rlcd') {
-        // RLCD 脚本依赖：$TRAINING_ROOT/{train_rlcd.py,kev_rlcd_bridge.py,rlcd-lite/,rlcd-data/}
-        // 本地模式直接跑；远端模式需先同步脚本（暂不开放，提示用本机）
-        if (!isLocal(server)) {
-          return sendJson(res, 400, { ok: false, error: 'RLCD 训练暂只支持本机训练服务器（rlcd-lite 脚本环境需在 TRAINING_ROOT 指定的目录）。远端部署待阶段 2。' });
+        // RLCD 脚本依赖：RLCD_ROOT 下 {train_rlcd.py,kev_rlcd_bridge.py,rlcd-lite/,rlcd-data/}
+        // 放行条件：本地模式 或 配置了 rlcdRoot 的 SSH 服务器（脚本环境在目标机器上，
+        // 如 A1000 笔记本的 D:/llm-training——2026-11-13 起远程 RLCD 可用）
+        const rlcdRoot = isLocal(server) ? RLCD_ROOT : (server.rlcdRoot || '');
+        if (!isLocal(server) && !rlcdRoot) {
+          return sendJson(res, 400, { ok: false, error: 'RLCD 训练需要训练服务器上有 rlcd-lite 脚本环境：本地模式自动可用；SSH 服务器请在配置里填写 rlcdRoot（脚本根目录，如 D:/llm-training）。' });
         }
         // 1) 上传原始 decision JSONL（复用已读取的原始文本，保持逐行格式）
         await sshWriteFile(server, workdir + '/data/' + ds.fileName, dsRawContent);
@@ -1673,17 +1951,27 @@ async function handleModelTrainingRequest(req, res) {
         const rlcd = buildRlcdTrainCommand(server, jobId, cfg, ds);
         // kev_rlcd_bridge 的输入是远端 data/<file>；输出到 rlcd-data/<jobId>/
         const prepCmd =
-          shq(rlcd.pyBin) + ' ' + shq(TRAINING_ROOT + '/kev_rlcd_bridge.py') +
+          shq(rlcd.pyBin) + ' ' + shq(rlcdRoot + '/kev_rlcd_bridge.py') +
           ' data/' + ds.fileName +
           ' rlcd-data/' + jobId +
           ' --calib-frac ' + shq(String(cfg.rlcdCalibFrac || 0.1)) +
           ' --seed ' + shq(String(cfg.seed == null ? 0 : cfg.seed));
         const rlcdCmdLine = shq(rlcd.pyBin) + ' ' + rlcd.args.map(shq).join(' ');
-        const startCmd =
-          `cd ${shq(workdir)} && mkdir -p rlcd-data/${jobId} && ` +
-          `{ ${prepCmd} || exit 1; } && ` +
-          `{ nohup bash -c 'PYTHONUNBUFFERED=1 HF_HUB_OFFLINE=1 ${rlcdCmdLine} > logs/${jobId}.log 2>&1; echo $? > logs/${jobId}.exit' >/dev/null 2>&1 & }; echo $! > run/${jobId}.pid`;
-        await sshExec(server, startCmd, 60000);
+        let startCmd;
+        if (server.windowsShell) {
+          // Windows：bridge 同步跑完 → 独立进程跑训练（RunJob.ps1 + Start-Process cmd）
+          const innerRlcd = 'bash -c ' + shq('PYTHONUNBUFFERED=1 HF_HUB_OFFLINE=1 ' + rlcdCmdLine +
+            '; echo $? > logs/' + jobId + '.exit');
+          const prelude = 'mkdir -p rlcd-data/' + jobId + ' && { ' + prepCmd + ' || exit 1; } && ';
+          startCmd = await windowsDetachedStart(server, workdir, jobId, prelude + innerRlcd);
+          await sshExec(server, startCmd, 60000);
+        } else {
+          startCmd =
+            `cd ${wq(workdir)} && mkdir -p rlcd-data/${jobId} && ` +
+            `{ ${prepCmd} || exit 1; } && ` +
+            `{ nohup bash -c 'PYTHONUNBUFFERED=1 HF_HUB_OFFLINE=1 ${rlcdCmdLine} > logs/${jobId}.log 2>&1; echo $? > logs/${jobId}.exit' >/dev/null 2>&1 & }; echo $! > run/${jobId}.pid`;
+          await sshExec(server, startCmd, 60000);
+        }
         const job = {
           id: jobId,
           name: p.name || (cfg.modelName + ' RLCD 决策训练'),
@@ -1706,6 +1994,9 @@ async function handleModelTrainingRequest(req, res) {
 
       // ═══ 决策模型分支（kind=decision → kev 训练，python -m kev.train）═══
       if (ds.kind === 'decision') {
+        // kev 包依赖：训练服务器的 python 环境需已安装 kev（本地模式平台自带；
+        // SSH 远端需目标机器预装——A1000 笔记本的 venv 已装 kev，2026-11-13 验证
+        // python -c 'import kev' 通过。装没装由提交后的报错自然暴露，不再一刀切拦截）
         // 内存预检（本地模式）：kev 训练进程约需 基座模型权重×2.5 + 1.5GB 常驻。
         // 系统空闲内存不足时提前警告（实测 1200 条稳定吃 3.7GB；不足会在编码阶段被 Windows RADAR 强杀）。
         if (isLocal(server)) {
@@ -1731,8 +2022,16 @@ async function handleModelTrainingRequest(req, res) {
         // kev 参数含 cfg.modelName / kevInitFrom / kevLora（均来自 API body），
         // 必须 shell 转义后才能拼进 nohup bash -c
         const kevCmdLine = shq(kev.pyBin) + ' ' + kev.args.map(shq).join(' ');
-        const startCmd =
-          `cd ${shq(workdir)} && { nohup bash -c 'PYTHONUNBUFFERED=1 ${kevCmdLine} > logs/${jobId}.log 2>&1; echo $? > logs/${jobId}.exit' >/dev/null 2>&1 & }; echo $! > run/${jobId}.pid`;
+        let startCmd;
+        if (server.windowsShell) {
+          // Windows：独立进程跑 kev 训练（RunJob.ps1 + Start-Process cmd）
+          const innerKev = 'bash -c ' + shq('PYTHONUNBUFFERED=1 ' + kevCmdLine +
+            '; echo $? > logs/' + jobId + '.exit');
+          startCmd = await windowsDetachedStart(server, workdir, jobId, innerKev);
+        } else {
+          startCmd =
+            `cd ${wq(workdir)} && { nohup bash -c 'PYTHONUNBUFFERED=1 ${kevCmdLine} > logs/${jobId}.log 2>&1; echo $? > logs/${jobId}.exit' >/dev/null 2>&1 & }; echo $! > run/${jobId}.pid`;
+        }
         await sshExec(server, startCmd, 20000);
         const job = {
           id: jobId,
@@ -1759,7 +2058,7 @@ async function handleModelTrainingRequest(req, res) {
       // 3) 合并 dataset_info.json（远端读取→合并→写回）
       const infoEntry = datasetInfoEntry(ds);
       const mergeScript =
-        `cd ${shq(workdir)}/data && python3 - <<'PYEOF'\n` +
+        `cd ${wq(workdir)}/data && ${shq(resolvePyBin(server))} - <<'PYEOF'\n` +
         `import json, os\n` +
         `info = {}\n` +
         `if os.path.exists('dataset_info.json'):\n` +
@@ -1777,12 +2076,19 @@ async function handleModelTrainingRequest(req, res) {
       }
       // 4) 上传任务 YAML
       await sshWriteFile(server, workdir + '/jobs/' + jobId + '.yaml', yaml);
-      // 5) nohup 启动训练。注意：& 优先级低于 &&，必须把 cd+nohup 包进 { }，
-      //    否则 echo $! > run/xxx.pid 会在错误目录执行（pid 文件写丢）。
+      // 5) 启动训练（Windows 走 windowsDetachedStart 独立进程；Linux 走 nohup 链。
+      //    Windows 三坑与最终形态的实测记录见 windowsDetachedStart 函数注释）
       const cliBin = server.cliPath || 'llamafactory-cli';
-      const startCmd =
-        `cd ${shq(workdir)} && { nohup bash -c 'PYTHONUNBUFFERED=1 ${shq(cliBin)} train jobs/${jobId}.yaml > logs/${jobId}.log 2>&1; echo $? > logs/${jobId}.exit' >/dev/null 2>&1 & }; echo $! > run/${jobId}.pid`;
-      await sshExec(server, startCmd, 20000);
+      let startCmd;
+      if (server.windowsShell) {
+        const innerLf = 'bash -c ' + shq('PYTHONUNBUFFERED=1 ' + shq(cliBin) + ' train jobs/' + jobId + '.yaml' +
+          '; echo $? > logs/' + jobId + '.exit');
+        startCmd = await windowsDetachedStart(server, workdir, jobId, innerLf);
+      } else {
+        startCmd =
+          `cd ${wq(workdir)} && { nohup bash -c 'PYTHONUNBUFFERED=1 ${shq(cliBin)} train jobs/${jobId}.yaml > logs/${jobId}.log 2>&1; echo $? > logs/${jobId}.exit' >/dev/null 2>&1 & }; echo $! > run/${jobId}.pid`;
+      }
+      await sshExec(server, startCmd, 30000);
 
       const job = {
         id: jobId,
@@ -1826,20 +2132,24 @@ async function handleModelTrainingRequest(req, res) {
     // 只对 running 任务做远端对账（限制并发，避免 SSH 风暴）
     const running = jobs.filter(j => j.status === 'running').slice(0, 5);
     const serverCache = {};
-    for (const j of running) {
-      const server = serverCache[j.serverId] || (serverCache[j.serverId] = findServer(j.serverId));
-      if (server) await refreshJobStatus(j, server);
-    }
+    // 按服务器分组：同服务器任务串行对账（复用连接、防 SSH 风暴），不同服务器并行
+    const byServer = {};
+    running.forEach(j => { (byServer[j.serverId] = byServer[j.serverId] || []).push(j); });
+    await Promise.all(Object.keys(byServer).map(async sid => {
+      const server = serverCache[sid] || (serverCache[sid] = findServer(sid));
+      if (!server) return;
+      for (const j of byServer[sid]) await refreshJobStatus(j, server);
+    }));
     // 终态低频对账：远端手动重启/清理后，平台不能永远停在旧的 completed/failed 状态。
     // 每 10 分钟最多对账 2 条，避免列表接口变成 SSH 风暴。
     const staleDone = jobs.filter(function (j) {
       return j.status !== 'running' && !j.unreachable &&
         (!j.lastCheckedAt || Date.now() - j.lastCheckedAt > 10 * 60 * 1000);
     }).slice(0, 2);
-    for (const j of staleDone) {
+    await Promise.all(staleDone.map(async j => {
       const server = serverCache[j.serverId] || (serverCache[j.serverId] = findServer(j.serverId));
       if (server) await refreshJobStatus(j, server);
-    }
+    }));
     jobs = listJobs();
     // 服务重启后不会重放「刚完成」事件，这里对已完成且配置了自动评估的任务补一次排队
     jobs.forEach(function (j) { if (j.status === 'completed') autoEvaluateIfNeeded(j); });
@@ -1892,7 +2202,7 @@ async function handleModelTrainingRequest(req, res) {
           try {
             const workdir0 = server.remoteWorkdir || '~/ai-harbor-training';
             const mr = await sshExec(server,
-              `cd ${shq(workdir0)} && cat saves/${jobId}/metrics.jsonl 2>/dev/null`, 30000);
+              `cd ${wq(workdir0)} && cat saves/${jobId}/metrics.jsonl 2>/dev/null`, 30000);
             const rebuilt = [];
             for (const line of (mr.stdout || '').split('\n')) {
               const t = line.trim();
@@ -1941,7 +2251,7 @@ async function handleModelTrainingRequest(req, res) {
         if (job.trainMode === 'rlcd') {
           rebuilt.length = 0;
           const mr = await sshExec(server,
-            `cd ${shq(workdir0)} && cat saves/${jobId}/metrics.jsonl 2>/dev/null`, 30000);
+            `cd ${wq(workdir0)} && cat saves/${jobId}/metrics.jsonl 2>/dev/null`, 30000);
           for (const line of (mr.stdout || '').split('\n')) {
             const t = line.trim();
             if (!/^\{"t":/.test(t)) continue;
@@ -2028,20 +2338,12 @@ async function handleModelTrainingRequest(req, res) {
       if (!server) return sendJson(res, 400, { ok: false, error: 'server config missing' });
       const workdir = server.remoteWorkdir || '~/ai-harbor-training';
       const cfg = job.config || {};
-      const chatYamlLines = [
-        'model_name_or_path: ' + JSON.stringify(cfg.modelName || ''),
-        'adapter_name_or_path: saves/' + jobId,
-        'template: ' + (cfg.template || 'qwen'),
-        'finetuning_type: ' + (cfg.finetuningType || 'lora'),
-        'trust_remote_code: true',
-      ];
-      const chatYaml = chatYamlLines.join('\n') + '\n';
       try {
-        await sshWriteFile(server, workdir + '/jobs/' + jobId + '.chat.yaml', chatYaml);
         // 用 ChatModel API 单轮问答（交互式 chat 命令在无 TTY 环境会 EOF 报错）。
         // 注意：python -c 传多行代码在 bash 单引号里 \n 不换行会 SyntaxError，
         // 所以把脚本写成 .py 文件再执行（远端/本地通吃）。
-        const cliBinChat = server.cliPath ? path.dirname(server.cliPath).replace(/\\/g, '/') + '/python.exe' : 'python3';
+        // （清理：曾同时写 .chat.yaml 但从未被使用，已删除；pyBin 曾硬拼 python.exe，改走 resolvePyBin）
+        const cliBinChat = resolvePyBin(server);
         const pyCode =
           'from llamafactory.chat import ChatModel\n' +
           'args = {"model_name_or_path": ' + JSON.stringify(cfg.modelName || '') + ', ' +
@@ -2053,7 +2355,7 @@ async function handleModelTrainingRequest(req, res) {
           'for resp in chat.chat([{"role": "user", "content": ' + JSON.stringify(prompt) + '}], max_new_tokens=512):\n' +
           '    print(resp.response_text)\n';
         await sshWriteFile(server, workdir + '/jobs/' + jobId + '.chat.py', pyCode);
-        const chatCmd = `cd ${shq(workdir)} && ${shq(cliBinChat)} jobs/${jobId}.chat.py 2>&1 | tail -40`;
+        const chatCmd = `cd ${wq(workdir)} && ${shq(cliBinChat)} jobs/${jobId}.chat.py 2>&1 | tail -40`;
         const r = await sshExec(server, chatCmd, 320000);
         return sendJson(res, 200, { ok: true, output: (r.stdout || '') + (r.stderr ? '\n' + r.stderr : '') });
       } catch (e) {
@@ -2082,11 +2384,13 @@ async function handleModelTrainingRequest(req, res) {
         'export_legacy_format: false',
       ].join('\n') + '\n';
       try {
-        await sshExec(server, `mkdir -p ${shq(workdir)}/exports`, 15000);
+        // 历史缺陷：导出命令硬编码 llamafactory-cli，配了自定义 cliPath 的服务器导出必挂
+        const cliBinExport = server.cliPath || 'llamafactory-cli';
+        await sshExec(server, `mkdir -p ${wq(workdir)}/exports`, 15000);
         await sshWriteFile(server, workdir + '/jobs/' + jobId + '.export.yaml', exportYaml);
         return sendJson(res, 200, {
           ok: true,
-          command: `cd ${shq(workdir)} && llamafactory-cli export jobs/${jobId}.export.yaml`,
+          command: `cd ${wq(workdir)} && ${shq(cliBinExport)} export jobs/${jobId}.export.yaml`,
           yaml: exportYaml,
           note: '合并 LoRA 权重导出为独立模型（注意：导出时不要包用量化的模型）',
         });
@@ -2106,7 +2410,7 @@ async function handleModelTrainingRequest(req, res) {
       const skip = Math.max(0, parseInt(p.skip, 10) || 0);                        // 起始行（0-based）
       try {
         const r = await sshExec(server,
-          `cd ${shq(workdir)} && LOG=logs/${jobId}.log; if [ -f $LOG ]; then wc -l < $LOG; sed -n '${skip + 1},${skip + lines}p' $LOG; else echo 0; echo "(日志不存在)"; fi`,
+          `cd ${wq(workdir)} && LOG=logs/${jobId}.log; if [ -f $LOG ]; then wc -l < $LOG; sed -n '${skip + 1},${skip + lines}p' $LOG; else echo 0; echo "(日志不存在)"; fi`,
           30000);
         const out = r.stdout || '';
         const nl = out.indexOf('\n');
@@ -2130,7 +2434,7 @@ async function handleModelTrainingRequest(req, res) {
       const workdir = server.remoteWorkdir || '~/ai-harbor-training';
       try {
         const r = await sshExec(server,
-          `cd ${shq(workdir)}/saves/${jobId} 2>/dev/null && ` +
+          `cd ${wq(workdir)}/saves/${jobId} 2>/dev/null && ` +
           `echo '== files =='; ls -lah --time-style=+%Y-%m-%d\ %H:%M 2>/dev/null | tail -n +2; ` +
           `echo '== checkpoints =='; for d in checkpoint-*; do [ -d "$d" ] || continue; echo "-- $d"; ls -lah --time-style=+%Y-%m-%d\ %H:%M "$d" 2>/dev/null | tail -n +2 | head -20; done; ` +
           `echo '== trainer_log =='; [ -f trainer_log.jsonl ] && tail -5 trainer_log.jsonl; ` +
@@ -2151,15 +2455,24 @@ async function handleModelTrainingRequest(req, res) {
       const server = findServer(job.serverId);
       if (!server) return sendJson(res, 400, { ok: false, error: 'server config missing' });
       if (job.status === 'running') return sendJson(res, 400, { ok: false, error: '任务正在运行，不能续训' });
+      // 并发锁：服务器上有其他 running 任务时不能并发续训
+      const busyOther = listJobs().find(j => j.serverId === server.id && j.status === 'running' && j.id !== job.id);
+      if (busyOther) return sendJson(res, 409, { ok: false, error: '服务器上有任务 ' + busyOther.id + ' 正在运行，不能并发续训' });
       const workdir = server.remoteWorkdir || '~/ai-harbor-training';
       const body = await parseRequestBody(req);
       const p = body.data || {};
+      // checkpoint 名先校验再碰 SSH（用户输入最终写入 YAML——仅放行 LF 标准名，防注入）
+      if (p.checkpoint && !/^(checkpoint|step)-\d+$/.test(p.checkpoint)) {
+        return sendJson(res, 400, { ok: false, error: 'checkpoint 名称不合法（应为 checkpoint-<数字> 或 step-<数字>）' });
+      }
       try {
         // 找最新 checkpoint（或用户指定的）
         const ckptRes = await sshExec(server,
-          `cd ${shq(workdir)} && ls -d saves/${jobId}/checkpoint-* 2>/dev/null | sort -t- -k2 -n | tail -1`, 15000);
+          `cd ${wq(workdir)} && ls -d saves/${jobId}/checkpoint-* 2>/dev/null | sort -t- -k2 -n | tail -1`, 15000);
         let ckpt = (ckptRes.stdout || '').trim();
-        if (p.checkpoint) ckpt = 'saves/' + jobId + '/' + p.checkpoint;
+        if (p.checkpoint) {
+          ckpt = 'saves/' + jobId + '/' + p.checkpoint;
+        }
         if (!ckpt) return sendJson(res, 400, { ok: false, error: '未找到任何 checkpoint，无法续训（训练可能从未保存过）' });
 
         // 续训 YAML：原配置 + resume_from_checkpoint
@@ -2169,7 +2482,7 @@ async function handleModelTrainingRequest(req, res) {
         await sshWriteFile(server, workdir + '/jobs/' + newJobId + '.resume.yaml', resumeYaml);
         const cliBin2 = server.cliPath || 'llamafactory-cli';
         const startCmd =
-          `cd ${shq(workdir)} && { nohup bash -c 'PYTHONUNBUFFERED=1 ${shq(cliBin2)} train jobs/${newJobId}.resume.yaml > logs/${newJobId}.log 2>&1; echo $? > logs/${newJobId}.exit' >/dev/null 2>&1 & }; echo $! > run/${newJobId}.pid`;
+          `cd ${wq(workdir)} && { nohup bash -c 'PYTHONUNBUFFERED=1 ${shq(cliBin2)} train jobs/${newJobId}.resume.yaml > logs/${newJobId}.log 2>&1; echo $? > logs/${newJobId}.exit' >/dev/null 2>&1 & }; echo $! > run/${newJobId}.pid`;
         await sshExec(server, startCmd, 20000);
         const updated = Object.assign({}, job, {
           status: 'running',
@@ -2194,16 +2507,18 @@ async function handleModelTrainingRequest(req, res) {
         if (!serverK) return sendJson(res, 400, { ok: false, error: 'server config missing' });
         const dsK = listDatasets().find(function (d) { return d.id === job.datasetId; });
         if (!dsK) return sendJson(res, 400, { ok: false, error: '原决策数据集已删除，无法克隆' });
+        const busyK = listJobs().find(j => j.serverId === serverK.id && j.status === 'running');
+        if (busyK) return sendJson(res, 409, { ok: false, error: '服务器上有任务 ' + busyK.id + ' 正在运行，不能并发克隆' });
         const jobIdK = newId('job');
         const wdK = serverK.remoteWorkdir || '~/ai-harbor-training';
         const cfgK = Object.assign({}, job.config, p.overrides || {}, { outputDir: 'saves/' + jobIdK });
         const kevK = buildKevTrainCommand(serverK, jobIdK, cfgK, dsK);
         const cmdK = shq(kevK.pyBin) + ' ' + kevK.args.map(shq).join(' ');
         try {
-          await sshExec(serverK, `mkdir -p ${shq(wdK)}/data ${shq(wdK)}/jobs ${shq(wdK)}/logs ${shq(wdK)}/run ${shq(wdK)}/saves`, 15000);
+          await sshExec(serverK, `mkdir -p ${wq(wdK)}/data ${wq(wdK)}/jobs ${wq(wdK)}/logs ${wq(wdK)}/run ${wq(wdK)}/saves`, 15000);
           await sshWriteFile(serverK, wdK + '/data/' + dsK.fileName,
             fs.readFileSync(path.join(DATASETS_DIR, dsK.fileName), 'utf8'));
-          const startK = `cd ${shq(wdK)} && { nohup bash -c 'PYTHONUNBUFFERED=1 ${cmdK} > logs/${jobIdK}.log 2>&1; echo $? > logs/${jobIdK}.exit' >/dev/null 2>&1 & }; echo $! > run/${jobIdK}.pid`;
+          const startK = `cd ${wq(wdK)} && { nohup bash -c 'PYTHONUNBUFFERED=1 ${cmdK} > logs/${jobIdK}.log 2>&1; echo $? > logs/${jobIdK}.exit' >/dev/null 2>&1 & }; echo $! > run/${jobIdK}.pid`;
           await sshExec(serverK, startK, 20000);
           const newJobK = {
             id: jobIdK, name: p.name || job.name + ' (克隆)',
@@ -2222,6 +2537,9 @@ async function handleModelTrainingRequest(req, res) {
       }
       const server = findServer(job.serverId);
       if (!server) return sendJson(res, 400, { ok: false, error: 'server config missing' });
+      // 并发锁：LF 克隆同样会在目标服务器上立即起训练进程
+      const busyC = listJobs().find(j => j.serverId === server.id && j.status === 'running');
+      if (busyC) return sendJson(res, 409, { ok: false, error: '服务器上有任务 ' + busyC.id + ' 正在运行，不能并发克隆' });
       const workdir = server.remoteWorkdir || '~/ai-harbor-training';
       const jobIdNew = newId('job');
       const cfg = Object.assign({}, job.config, p.overrides || {}, {
@@ -2231,34 +2549,46 @@ async function handleModelTrainingRequest(req, res) {
       });
       const yaml = buildYaml(cfg);
       try {
-        await sshExec(server, `mkdir -p ${shq(workdir)}/jobs ${shq(workdir)}/logs ${shq(workdir)}/run ${shq(workdir)}/saves`, 15000);
-        // 数据集应已注册过（同名 dataset_info 条目仍在）——直接校验存在
+        await sshExec(server, `mkdir -p ${wq(workdir)}/jobs ${wq(workdir)}/logs ${wq(workdir)}/run ${wq(workdir)}/saves`, 15000);
+        // 数据集应已注册过（同名 dataset_info 条目仍在）——直接校验存在。
+        // 旧实现把 dataset 名拼进双引号 python -c 且 shq 套单引号产生 ''name''
+        // （语法恒失败，重复上传）；且数据集源文件被删后仍照常起一个必失败任务。
+        // 改为 heredoc（dataset 名经 JSON.stringify 进 Python 字面量，无注入面），
+        // 校验失败且本地无源数据时直接 400。
+        const clonePyBin = resolvePyBin(server);
         const check = await sshExec(server,
-          `cd ${shq(workdir)}/data && python3 -c "import json,sys;info=json.load(open('dataset_info.json'));sys.exit(0 if '${shq(cfg.dataset)}' in info else 1)"`, 15000);
+          `cd ${wq(workdir)}/data && ${shq(clonePyBin)} - <<'PYEOF'\n` +
+          `import json, sys\n` +
+          `info = {}\n` +
+          `try:\n` +
+          `    info = json.load(open('dataset_info.json'))\n` +
+          `except Exception:\n` +
+          `    pass\n` +
+          `sys.exit(0 if ${JSON.stringify(cfg.dataset)} in info else 1)\n` +
+          `PYEOF`, 15000);
         if (check.code !== 0) {
           // 数据集被删了则重新上传
           const ds = listDatasets().find(d => d.id === job.datasetId);
-          if (ds) {
-            const dsRawContent = fs.readFileSync(path.join(DATASETS_DIR, ds.fileName), 'utf8');
-            await sshWriteFile(server, workdir + '/data/' + ds.fileName, dsRawContent);
-            const infoEntry = datasetInfoEntry(ds);
-            const mergeScript =
-              `cd ${shq(workdir)}/data && python3 - <<'PYEOF'\n` +
-              `import json, os\n` +
-              `info = {}\n` +
-              `if os.path.exists('dataset_info.json'):\n` +
-              `    try: info = json.load(open('dataset_info.json'))\n` +
-              `    except Exception: info = {}\n` +
-              `info[${JSON.stringify(cfg.dataset)}] = ${JSON.stringify(infoEntry)}\n` +
-              `json.dump(info, open('dataset_info.json', 'w'), ensure_ascii=False, indent=2)\n` +
-              `PYEOF`;
-            await sshExec(server, mergeScript, 30000);
-          }
+          if (!ds) return sendJson(res, 400, { ok: false, error: '远端数据集 ' + cfg.dataset + ' 未注册，且本地已无源数据文件，无法克隆' });
+          const dsRawContent = fs.readFileSync(path.join(DATASETS_DIR, ds.fileName), 'utf8');
+          await sshWriteFile(server, workdir + '/data/' + ds.fileName, dsRawContent);
+          const infoEntry = datasetInfoEntry(ds);
+          const mergeScript =
+            `cd ${wq(workdir)}/data && ${shq(clonePyBin)} - <<'PYEOF'\n` +
+            `import json, os\n` +
+            `info = {}\n` +
+            `if os.path.exists('dataset_info.json'):\n` +
+            `    try: info = json.load(open('dataset_info.json'))\n` +
+            `    except Exception: info = {}\n` +
+            `info[${JSON.stringify(cfg.dataset)}] = ${JSON.stringify(infoEntry)}\n` +
+            `json.dump(info, open('dataset_info.json', 'w'), ensure_ascii=False, indent=2)\n` +
+            `PYEOF`;
+          await sshExec(server, mergeScript, 30000);
         }
         await sshWriteFile(server, workdir + '/jobs/' + jobIdNew + '.yaml', yaml);
         const cliBin3 = server.cliPath || 'llamafactory-cli';
         const startCmd =
-          `cd ${shq(workdir)} && { nohup bash -c 'PYTHONUNBUFFERED=1 ${shq(cliBin3)} train jobs/${jobIdNew}.yaml > logs/${jobIdNew}.log 2>&1; echo $? > logs/${jobIdNew}.exit' >/dev/null 2>&1 & }; echo $! > run/${jobIdNew}.pid`;
+          `cd ${wq(workdir)} && { nohup bash -c 'PYTHONUNBUFFERED=1 ${shq(cliBin3)} train jobs/${jobIdNew}.yaml > logs/${jobIdNew}.log 2>&1; echo $? > logs/${jobIdNew}.exit' >/dev/null 2>&1 & }; echo $! > run/${jobIdNew}.pid`;
         await sshExec(server, startCmd, 20000);
         const newJob = {
           id: jobIdNew,

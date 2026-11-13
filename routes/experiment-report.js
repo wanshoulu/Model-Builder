@@ -873,23 +873,25 @@ async function handleExperimentReportRequest(req, res) {
     }
     if (sub === 'metrics' && req.method === 'POST') {
       const items = Array.isArray(body.entries) ? body.entries : [body];
-      const store = withMetrics(function (store) {
-      const added = [];
-      items.forEach(function (it) {
-        if (!it.runId || !it.name || num(it.value) == null) return;
-        const rec = {
-          id: newId('met'), runId: String(it.runId), name: String(it.name).trim(),
-          value: num(it.value), unit: String(it.unit || ''),
-          task: String(it.task || ''), seed: it.seed === '' || it.seed == null ? null : num(it.seed),
-          n: it.n === '' || it.n == null ? null : num(it.n),
-          direction: it.direction || guessDirection(it.name),
-          source: it.source || 'manual', note: String(it.note || ''), createdAt: Date.now()
-        };
-        store.entries.push(rec); added.push(rec);
+      let addedCount = 0;
+      const store = withMetrics(function (cur) {
+        const added = [];
+        items.forEach(function (it) {
+          if (!it.runId || !it.name || num(it.value) == null) return;
+          const rec = {
+            id: newId('met'), runId: String(it.runId), name: String(it.name).trim(),
+            value: num(it.value), unit: String(it.unit || ''),
+            task: String(it.task || ''), seed: it.seed === '' || it.seed == null ? null : num(it.seed),
+            n: it.n === '' || it.n == null ? null : num(it.n),
+            direction: it.direction || guessDirection(it.name),
+            source: it.source || 'manual', note: String(it.note || ''), createdAt: Date.now()
+          };
+          cur.entries.push(rec); added.push(rec);
+        });
+        addedCount = added.length;
+        return cur;
       });
-      return store;
-      });
-      return sendJson(res, 200, { ok: true, added: added.length, entries: store.entries });
+      return sendJson(res, 200, { ok: true, added: addedCount, entries: store.entries });
     }
     if (sub === 'metrics/delete' && req.method === 'POST') {
       const ids = Array.isArray(body.ids) ? body.ids : [body.id];

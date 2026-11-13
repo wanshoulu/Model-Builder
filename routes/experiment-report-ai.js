@@ -469,7 +469,7 @@ function pickModel(requested) {
   const list = listEngines();
   if (!list.length) throw new Error('未配置任何云端模型密钥（QWEN_KEY / DEEPSEEK_KEY / GLM_KEY / KIMI_KEY），无法生成 AI 报告；平台的统计分析与图表不依赖密钥，仍可正常使用');
   if (requested && list.some(function (x) { return x.id === requested; })) return requested;
-  const prefer = ['qwen3.7-flash', 'qwen-plus', 'deepseek-chat', 'glm-5.2', 'kimi-latest'];
+  const prefer = ['qwen3.8-flash', 'qwen3.7-flash', 'qwen-plus', 'deepseek-chat', 'glm-5.2', 'kimi-latest'];
   for (const p of prefer) if (list.some(function (x) { return x.id === p; })) return p;
   return list[0].id;
 }

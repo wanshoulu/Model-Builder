@@ -35,8 +35,8 @@ const backends = {
     },
     generate: async (messages, opts) => {
       const { API_ROUTES } = require('../config/api-keys');
-      // 模型选择：opts.model 为空则按平台优先级自动挑（qwen3.7-flash → deepseek → glm → kimi）
-      const PRIORITY = ['qwen3.7-flash', 'deepseek-chat', 'glm-5.2', 'kimi-latest'];
+      // 模型选择：opts.model 为空则按平台优先级自动挑（qwen3.8-flash → qwen3.7-flash → deepseek → glm → kimi）
+      const PRIORITY = ['qwen3.8-flash', 'qwen3.7-flash', 'deepseek-chat', 'glm-5.2', 'kimi-latest'];
       let route = null;
       if (opts.model && API_ROUTES[opts.model] && API_ROUTES[opts.model].getKey()) route = { r: API_ROUTES[opts.model], model: opts.model };
       for (const name of opts.model ? [] : PRIORITY) {
@@ -83,6 +83,10 @@ const backends = {
     available: () => true,
     generate: async (messages, opts) => {
       const baseUrl = opts.baseUrl || 'http://localhost:8000/v1';
+      // 最小校验：仅放行 http(s) 绝对地址（历史缺陷：baseUrl 完全不校验，可注入异常 scheme/路径）
+      if (!/^https?:\/\/[^\s"'<>]+$/.test(baseUrl)) {
+        throw new Error('模型服务地址不合法（应为 http(s)://host[:port]/... 形式，如 http://localhost:8000/v1）');
+      }
       const model = opts.model || 'default';
       // LLaMA-Factory API 只支持 user/assistant 交替（无 system）——把 system 合并进首条 user
       let merged = messages.slice();
