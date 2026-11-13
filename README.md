@@ -13,7 +13,7 @@
 
 面向个人与小团队的**本地大模型训练全流程工具**。它把训练 LLaMA-Factory / kev / RLCD 作业时的手工环节做成了界面：造数据（合成 + 七段质检漏斗）→ 提交训练（进程树管理）→ 训练完自动评估（Wilson + record-level bootstrap 双置信区间）→ 多任务实验对比（Plotly 图表 + 可选 AI 叙述）。
 
-不依赖云服务：训练跑在本机或 SSH 远端（如一台有 GPU 的 Linux 机器），图表用本地化的 Plotly（无 CDN），密钥只进环境变量。
+不依赖云服务：训练跑在本机或 SSH 远端（如一台有 GPU 的 Linux 机器、或一台装了 Git Bash sshd 的 Windows 笔记本），图表用本地化的 Plotly（无 CDN），密钥只进环境变量。
 
 ## 它解决什么问题
 
@@ -31,8 +31,9 @@
 - **7 段质检漏斗**：空值 / 布局归一 / 精确去重 / 语义去重（3-gram Jaccard）/ 长度截断 / 语言过滤 / 评测集泄漏隔离，每段独立计数
 - **7 种合成模式**：evol / rewrite / label-variant（按标签扩写）/ rule-map（零 LLM 成本）/ decision few-shot 等，支持种子注入与「禁止编造」约束
 - **8 种数据布局**：alpaca / sharegpt / openai_messages / qa_pairs / dpo_standard / alpaca_preference / pretrain_text / decision_kev，互转 fail-closed（二次归一化直接报错）
-- **三训练引擎**：LLaMA-Factory（yaml 生成 + 断点续训 + 克隆）、kev benchmark、RLCD-GRPO（rlcd-lite）
-- **进程树击杀**：Windows / Linux 下递归杀子进程不留孤儿；任务删除连带清理 data/ logs/ saves/ 全部产物与评估临时件
+- **三训练引擎**：LLaMA-Factory（yaml 生成 + 断点续训 + 克隆）、kev benchmark、RLCD-GRPO（rlcd-lite）——本机 / Linux SSH / **Windows SSH**（如笔记本 RTX A1000）三类训练机均可提交
+- **进程树击杀**：Linux 递归杀子进程；Windows 按 jobId 匹配命令行击杀原生进程链——均不留孤儿；任务删除连带清理 data/ logs/ saves/ 全部产物与评估临时件
+- **鉴权登录**：用户名密码（`MT_USERNAME` / `MT_PASSWORD`），HttpOnly + SameSite cookie 180 天免登，防爆破限流（5 分钟 10 次）；服务重启评估任务不丢（落盘恢复，中断任务标记 `interrupted`）
 - **自动评估**：训练完成即跑留出集，accuracy / macro-F1 / EM / token-F1 / ROUGE-L / 校准（ECE + Brier），指标回写任务并进实验报告
 - **双置信区间**：Wilson（快）与 record-level bootstrap（1000 次按记录重采样，处理多问题记录的单元相关性）
 - **实验报告**：多任务指标聚合 + 统计检验 + Plotly 本地图表；AI 叙述仅引用事实包内数字并回锚到图表
@@ -46,7 +47,7 @@ cd Model-Builder
 npm install && npm start     # → http://127.0.0.1:3011
 ```
 
-打开浏览器就是工作台首页（任务列表 + 新建训练任务向导）。默认端口 `3011` 而非 `3000`：本机 `3000` 通常是 AI Harbor 主站的端口，独立部署用不同端口可避免 `EADDRINUSE`；需改端口时设置 `PORT`。训练执行需要一台 Python 训练环境（本机或 SSH 远端），全部环境变量见 `.env.example`。
+打开浏览器就是工作台首页（任务列表 + 新建训练任务向导）。首次访问跳转登录页：默认用户名 `admin`，密码未设置时复用 `MT_TOKEN`（也未设置则启动时生成随机令牌打印在日志里）；生产部署请在 `.env` 里显式设置 `MT_USERNAME` / `MT_PASSWORD`。默认端口 `3011` 而非 `3000`：本机 `3000` 通常是 AI Harbor 主站的端口，独立部署用不同端口可避免 `EADDRINUSE`；需改端口时设置 `PORT`。训练执行需要一台 Python 训练环境（本机或 SSH 远端），全部环境变量见 `.env.example`。
 
 ## 训练环境准备（提交真实训练才需要）
 
@@ -90,14 +91,27 @@ python -m venv venv && venv/bin/pip install -r requirements.txt
 
 ```mermaid
 flowchart LR
-    UI[单页前端 tools/model-training.html<br/>Plotly 本地化] -->|/api/model-training| MT[routes/model-training.js<br/>任务编排 · 进程树 · SSH]
+    UI[单页前端 tools/model-training.html<br/>Plotly 本地化] -->|/api/auth/login| AUTH[server.js 鉴权网关<br/>账密登录 · 防爆破 · HttpOnly cookie]
+    AUTH -->|令牌校验| UI
+    UI -->|/api/model-training| MT[routes/model-training.js<br/>任务编排 · 进程树 · SSH]
     UI -->|/api/dataset-tools| DT[routes/dataset-tools*.js<br/>嗅探 · 漏斗 · 转换 · 合成]
     UI -->|/api/experiment-report| ER[routes/experiment-report*.js<br/>聚合 · 统计检验 · AI 叙述]
-    MT --> EV[routes/model-evaluation.js<br/>三引擎评估编排]
+    MT --> EV[routes/model-evaluation.js<br/>三引擎评估编排 · 任务落盘]
     EV --> EM[eval-metrics.js<br/>Wilson · bootstrap · 泄漏检测]
-    MT <-->|SSH / 本机| TR[训练环境<br/>LLaMA-Factory · kev · rlcd-lite]
+    MT -->|SSH ssh2 / 本机执行| TR[训练环境<br/>LLaMA-Factory · kev · rlcd-lite]
+    TR -->|Windows: 脱离会话启动<br/>Linux: nohup| WIN[Windows / Linux 训练机<br/>GPU · venv]
     DT --> PG[path-guard.js<br/>导入路径沙箱]
 ```
+
+### 训练机连接形态（2026-11 更新）
+
+| 形态 | 启动/击杀方式 | 说明 |
+|---|---|---|
+| 本机（Linux/macOS） | nohup + kill 进程树 | 原生形态 |
+| SSH 远端（Linux） | 同上，经 ssh2 库 | 原生形态 |
+| **SSH 远端（Windows）** | PowerShell `Start-Process cmd` 脱离会话启动；`Win32_Process` 按命令行匹配击杀 | **新增**：Git Bash sshd 默认 shell；`nohup` / `cmd start /b` 在 Windows sshd 下均不可用（会话断开杀进程树 / stdout 管道断裂），实测三种形态后落定 |
+
+Windows 训练机要点：sshd 默认 shell 需为 Git Bash（`HKLM\SOFTWARE\OpenSSH\DefaultShell = C:\Program Files\Git\bin\bash.exe`）；服务器配置勾选 `windowsShell`；RLCD 训练额外配 `rlcdRoot`（脚本根目录在目标机器上）。
 
 ## 名词表
 
@@ -136,8 +150,8 @@ training/                  训练环境：2 个 Python 运行时脚本 + 依赖/
 
 ## 已知限制
 
-- 免登录设计，默认只听 127.0.0.1；公网部署需自行加反向代理鉴权
-- RLCD 引擎暂只支持本机训练环境（脚本依赖 `TRAINING_ROOT` 布局，见 [training/README.md 已知限制](training/README.md#已知限制)）
+- 默认只听 127.0.0.1；公网部署请设置 `MT_USERNAME` / `MT_PASSWORD` 强口令（内置防爆破），传输层加密需自行加反向代理（HTTPS）
+- RLCD 引擎支持本机与 SSH 远端（服务器配置里填 `rlcdRoot` 指向目标机器上的脚本根）；Linux 远端走 nohup 链，Windows 远端走脱离会话启动器
 - 语义去重是 n-gram 近似，不等于语义级查重（同义不同词的重复检不出）
 - AI 叙述需要云 LLM 密钥（`QWEN_KEY` 等）；不配置时统计与图表完全可用
 - 干净 clone 缺少 `data/`（被 `.gitignore` 排除），`experiment-report-ui.test.js` 因无历史任务生成不了 loss 曲线，17 项断言会跳过；`npm test` 此时显示 173 项而非全量 190 项

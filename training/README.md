@@ -85,7 +85,8 @@ Windows 的 `TRAINING_CLI` 用 `./training/venv/Scripts/llamafactory-cli.exe`。
 ## 已知限制
 
 - 只做了无 GPU 验证；补入后未重跑完整训练，模型权重、CUDA 与 torch 版本差异都可能导致失败。
-- RLCD 分支只支持本机训练环境，`routes/model-training.js` 对远端 RLCD 直接返回 400。
+- ~~RLCD 分支只支持本机训练环境~~ **2026-11 更新**：SSH 远端 RLCD 已放开——在平台「训练服务器」配置里填 `rlcdRoot`（目标机器上的脚本根目录，Windows 训练机如 `D:/llm-training`）即可；本地模式仍走 `TRAINING_ROOT`/`RLCD_ROOT`。
+- Windows SSH 训练机（Git Bash sshd）：训练/评估进程用 PowerShell 脱离会话启动；`dataloader_num_workers` 强制 0（transformers 闭包 pickle 兼容）；击杀按 jobId 匹配命令行。首次接入实测：Win11 + RTX A1000 全链路（提交→断连存活→adapter 产出→自动评估）通过。
 - `sample-data/` 是 20 条冒烟样例，不是可训练的数据集；真实数据集由工作台「数据集」页签生成并落在 `TRAINING_WORKDIR/data/`。
 - `requirements.txt` 不含 LLaMA-Factory 本体，只覆盖 `rlcd-lite` 源码的最小依赖。
 - 两个脚本依赖 `os._exit` 规避 Windows + torch 2.9 退出阶段的 CUDA 清理误报（`train_rlcd.py` 尾部），换平台时需重新验证退出码语义。
